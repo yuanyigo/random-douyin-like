@@ -1,0 +1,1195 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>随机播放点赞过的视频</title>
+<!-- 内联 SVG favicon：不额外请求文件，也不怕路径/打包问题。
+     32×32 圆角方块用主题红，中间一个白色播放三角。 -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23fe2c55'/%3E%3Cpath d='M13 10.2v11.6L22.5 16z' fill='%23fff'/%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg:#0a0a0c; --panel:#131317; --panel2:#1a1a20; --line:#26262e; --line2:#34343f;
+    --fg:#ececf1; --dim:#8a8a97; --label:#c9c9d2;
+    --accent:#fe2c55; --accent2:#ff4d70;
+    --ok:#2ecc71; --warn:#f1c40f; --bad:#e74c3c; --r:12px;
+    /* 左栏宽度。调大调小只改这一个值即可（配套的窄屏断点在下面 main 那段）。 */
+    --side-w:256px;
+  }
+  *{box-sizing:border-box}
+  /* 应用外壳布局：整页不滚动，main 吃掉 header 之后的所有高度。
+     左栏内容多了在它自己内部滚，播放区永远撑满剩余空间。 */
+  html,body{height:100%}
+  body{margin:0;background:var(--bg);color:var(--fg);overflow:hidden;
+       display:flex;flex-direction:column;
+       font:14px/1.6 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+       -webkit-font-smoothing:antialiased}
+  header{flex:none;padding:14px 22px;border-bottom:1px solid var(--line);
+         display:flex;align-items:center;gap:12px;z-index:10;
+         background:rgba(10,10,12,.88);backdrop-filter:blur(10px)}
+  header h1{font-size:15px;margin:0;font-weight:600;letter-spacing:.01em}
+  header .spacer{flex:1}
+  .sub{color:var(--dim);font-size:12px;font-variant-numeric:tabular-nums}
+  main{flex:1;min-height:0;overflow:hidden;
+       display:grid;gap:12px;padding:14px 18px 16px;
+       grid-template-columns:var(--side-w) minmax(520px,1fr);align-items:stretch}
+  main>section{min-height:0;display:flex;flex-direction:column;gap:12px}
+  /* 左栏面板之间收紧到 8px。
+     ⚠ 原来实际有 26px：父容器 main>section 的 gap:12px，再叠上一条
+     .panel+.panel 的 margin-top:14px。flex 容器的 gap 已经把间距管住了，
+     margin 那条纯属多余，已删掉，只留这一个值。 */
+  main>section:first-child{overflow-y:auto;overflow-x:hidden;gap:8px}   /* 左栏放不下就内部滚 */
+  /* 断点必须盖住两栏的最小总宽：--side-w + 520 + gap 12 + 左右内边距 36 = 824px。
+     写小了的话，760~824px 这段窗口宽度下 grid 会横向溢出，而 main 是 overflow:hidden，
+     表现就是播放区右边被裁掉一截。媒体查询里不能用 var()，所以这里手写数字。 */
+  @media(max-width:860px){main{grid-template-columns:1fr}}
+  /* 收起左栏：直接降到单栏 + 隐藏左栏，而不是把列宽写成 0。
+     写 0 的话 gap 还留着一条 12px 的缝，而且 0 宽的 flex 容器在
+     窄屏媒体查询下还得再处理一遍。 */
+  body.side-off main{grid-template-columns:minmax(0,1fr)}
+  body.side-off main>section:first-child{display:none}
+  /* 切换按钮放 header 里 —— 收起来之后它必须还在，否则没法展开回来 */
+  header button{flex:none;height:28px;font-size:12.5px;padding:0 10px;border-radius:8px}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);padding:16px}
+  button{font:inherit;font-size:13.5px;color:var(--fg);background:var(--panel2);
+         border:1px solid var(--line);border-radius:9px;height:34px;padding:0 12px;
+         display:inline-flex;align-items:center;justify-content:center;gap:6px;
+         cursor:pointer;transition:background .12s,border-color .12s,transform .06s}
+  button:hover:not(:disabled){background:#22222a;border-color:var(--line2)}
+  button:active:not(:disabled){transform:translateY(1px)}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+  button.primary:hover:not(:disabled){background:var(--accent2);border-color:var(--accent2)}
+  button:disabled{opacity:.4;cursor:not-allowed}
+  .stack{display:flex;flex-direction:column;gap:10px}
+  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .row>button{flex:1 1 0;min-width:0}
+  textarea{width:100%;height:120px;resize:vertical;
+           font:12px/1.6 ui-monospace,Consolas,monospace;
+           background:#0d0d11;color:var(--fg);border:1px solid var(--line);
+           border-radius:9px;padding:10px}
+  textarea:focus{outline:none;border-color:var(--accent)}
+
+  /* 开关做成 pill，替掉系统默认复选框 —— 系统那只方框在这个暗色界面里很突兀 */
+  label.toggle{display:flex;align-items:center;gap:9px;font-size:13px;color:var(--label);
+               cursor:pointer;user-select:none}
+  label.toggle input{appearance:none;-webkit-appearance:none;flex:none;margin:0;
+    width:34px;height:19px;border-radius:10px;background:#2c2c35;position:relative;
+    cursor:pointer;transition:background .16s}
+  label.toggle input::after{content:"";position:absolute;top:2.5px;left:2.5px;
+    width:14px;height:14px;border-radius:50%;background:#9a9aa6;
+    transition:transform .16s,background .16s}
+  label.toggle input:checked{background:var(--accent)}
+  label.toggle input:checked::after{transform:translateX(15px);background:#fff}
+  label.toggle:hover input{background:#36363f}
+  label.toggle:hover input:checked{background:var(--accent2)}
+
+  /* 快捷键提示：原来用 inline <code> 会零碎换行，改成紧凑的 kbd 网格 */
+  .keys{display:flex;flex-wrap:wrap;gap:6px 12px;margin-top:12px;
+        font-size:11px;color:var(--dim)}
+  .keys span{display:inline-flex;align-items:center;gap:5px;white-space:nowrap}
+  kbd{display:inline-flex;align-items:center;justify-content:center;min-width:19px;height:19px;
+      padding:0 5px;background:#20202a;border:1px solid var(--line2);border-bottom-width:2px;
+      border-radius:5px;font:11px/1 ui-monospace,Consolas,monospace;color:#c8c8d2}
+
+  #progress{font-size:11.5px;color:var(--label);font-variant-numeric:tabular-nums}
+  .hint{font-size:12px;color:var(--dim);margin-top:8px;line-height:1.75}
+  code{background:var(--panel2);padding:1.5px 5px;border-radius:4px;font-size:11.5px;
+       font-family:ui-monospace,Consolas,monospace;color:#c8c8d2}
+
+  /* flex:1 + min-height:0 —— 高度由外壳布局给定，不再由内容撑开。
+     这样 stage.clientHeight 是稳定的，JS 可以直接拿它算播放区尺寸，
+     不会出现"内容撑高 stage → stage 又决定内容"的循环。
+     padding:0 —— 视频要贴到播放区边缘，不留内边距。边框和圆角由 stage 自己出，
+     所以 .phone 不再画自己的边框（否则两层边框叠在一起）。 */
+  .stage{flex:1;min-height:0;background:#000;border:1px solid var(--line);
+         border-radius:var(--r);display:flex;align-items:center;justify-content:center;
+         padding:0;overflow:hidden}
+  .placeholder{color:var(--dim);font-size:13px;text-align:center;
+               max-width:380px;line-height:1.9;padding:24px}
+  /* 圆角必须给 .phone 自己一份，不能只靠 .stage 裁。
+     因为横屏视频时 .phone 只占舞台的一部分（居中、不贴左右边），
+     .stage 的圆角在那个位置根本裁不到 —— 视频四角就会是方的。
+     .phone 已经没有边框了，所以这里加圆角不会和 .stage 叠成两层框。 */
+  .phone{width:390px;height:764px;max-width:100%;flex:none;border:0;
+         border-radius:var(--r);overflow:hidden;background:#000;position:relative}
+  /* 图文贴（图集）：没有视频流，用 <img> 显示。
+     和 video 同一位置、同一层级，靠 .phone.show-image 切换谁可见。
+     object-fit:contain 与视频保持一致（不裁切，留白处透出模糊背景）。 */
+  .poster{position:absolute;inset:0;z-index:1;width:100%;height:100%;
+          object-fit:contain;background:transparent;display:none}
+  .phone.show-image .poster{display:block}
+  .phone.show-image video{display:none}
+
+  /* background 必须是 transparent！
+     <video> 用 object-fit:contain 时元素盒子仍是满的，视频内容在里面留黑边，
+     而那圈黑边是元素的 background 画的 —— 设成 #000 就会把下面的模糊背景整个盖住。
+     透明之后，留黑边的区域才能透出背后的 canvas。 */
+  .phone video{position:relative;z-index:1;width:100%;height:100%;border:0;display:block;
+               background:transparent;object-fit:contain}
+
+  /* 模糊背景（仿抖音全屏两侧那圈颜色）：
+     在每条视频第一帧就绪时取一次色，画到 64×36 的小 canvas 上，
+     再由 CSS 放大 + 重模糊。静态，不跟着画面动。
+     不用第二个 <video> 省一份解码；不用封面图是为了省一次网络请求。
+     视频流经本地服务同源中转，所以 drawImage 不会污染 canvas。 */
+  .ambient{position:absolute;inset:0;width:100%;height:100%;z-index:0;pointer-events:none;
+           filter:blur(48px) saturate(1.7) brightness(.72);transform:scale(1.12)}
+
+  /* 文案遮罩：底部渐变，保证白字在亮画面上也读得清。
+     高度只包住文案区域即可 —— 原来 42% 会压暗将近半屏。
+     上下限用 clamp 兜住：窗口很小或全屏很大时都不至于过短/过长。 */
+  .scrim{position:absolute;left:0;right:0;bottom:0;z-index:2;pointer-events:none;
+         height:clamp(120px, 20%, 240px);
+         background:linear-gradient(to top,rgba(0,0,0,.78) 0%,rgba(0,0,0,.42) 45%,transparent 100%)}
+  /* 文案浮层：仿抖音 —— 左下角、白字带阴影、最多三行。
+     pointer-events:none 是关键：浮在播放器之上，但不能挡住原生控件。
+     bottom:64px 是为了避开原生控制条。 */
+  .caption{position:absolute;left:16px;right:16px;bottom:64px;z-index:3;
+    color:#fff;font-size:13.5px;line-height:1.6;font-weight:500;letter-spacing:.01em;
+    text-shadow:0 1px 4px rgba(0,0,0,.85), 0 0 14px rgba(0,0,0,.6);
+    pointer-events:none;
+    display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;
+    overflow:hidden;word-break:break-word;
+    transition:bottom .25s ease}
+
+  /* 原控制条自动隐藏后，文案落到底部（不然中间空着一条）。
+     控制条的显隐状态在 shadow DOM 里读不到，只能按鼠标活动近似 —— 见 controlsAppear()。 */
+  .phone.ctrl-hidden .caption{bottom:22px}
+
+  /* 图文贴：没有原生控制条（<video> 被 display:none 了），文案不必给它让位，
+     所以放得更低，而且不跟着鼠标升降（ctrl-hidden 对它无效）。
+     最后两条的类更多、优先级更高，正好压住上面两条规则。 */
+  .phone.show-image .caption,
+  .phone.show-image.ctrl-hidden .caption{bottom:36px}
+
+  /* 关掉「文案」开关：文案和底部渐变遮罩一起去掉。
+     那个遮罩只为文案的可读性存在，没有文案时它只是白压暗画面下半部分。 */
+  .phone.no-caption .caption,
+  .phone.no-caption .scrim{display:none}
+
+  /* 全屏：让「我们自己的 stage 容器」撑满，键盘焦点才留在父页面。
+     视频始终 object-fit:contain，不裁切 —— 竖屏在横向屏上必然留黑边。 */
+  .stage:fullscreen{background:#000;padding:0;border:0;border-radius:0;min-height:100vh}
+  .stage:fullscreen .phone{width:100vw !important;height:100vh !important;
+         border:0 !important;border-radius:0 !important;box-shadow:none}
+  .stage:fullscreen .placeholder{display:none}
+  .stage:fullscreen .caption{left:22px;right:38px;bottom:76px;-webkit-line-clamp:2;
+         font-size:14px;line-height:22px;
+         text-shadow:.5px .5px 1px rgba(0,0,0,.7)}
+  .stage:fullscreen .phone.ctrl-hidden .caption{bottom:28px}
+  /* 全屏图文：同样没有控制条，比视频低 */
+  .stage:fullscreen .phone.show-image .caption,
+  .stage:fullscreen .phone.show-image.ctrl-hidden .caption{bottom:52px}
+
+  /* 播放器下方那行：正常播放时是空的，出错时才显示提示 + 降级按钮。
+     :empty 让它空着时不占位置，否则会白留一条。 */
+  .nowplaying{margin-top:10px;font-size:12px;color:var(--dim);text-align:center;
+              font-family:ui-monospace,Consolas,monospace;font-variant-numeric:tabular-nums;
+              word-break:break-all}
+  .nowplaying:empty{display:none}
+
+  /* 可折叠面板 —— 标题按抖音侧栏那种「列表项」来做：
+     字号更大、字重中等、颜色更亮，选中/展开时有圆角胶囊底色。
+     原来是小号大写字母标签（11px / uppercase / letter-spacing），那是标签的语汇，
+     不是导航项的语汇。 */
+  details.panel{padding:4px;overflow:hidden}
+  details.panel>summary{padding:8px 7px;cursor:pointer;user-select:none;
+    font-size:13.5px;font-weight:500;letter-spacing:.01em;color:var(--label);
+    list-style:none;display:flex;align-items:center;gap:7px;border-radius:9px;
+    transition:background .13s,color .13s}
+  details.panel>summary::-webkit-details-marker{display:none}
+  details.panel>summary::before{content:"▸";font-size:10px;color:var(--dim);
+    transition:transform .18s,color .13s}
+  details.panel[open]>summary::before{transform:rotate(90deg);color:var(--label)}
+  details.panel>summary:hover{background:#1f1f27;color:var(--fg)}
+  details.panel[open]>summary{background:#25252e;color:#fff}
+  details.panel[open]>summary:hover{background:#2b2b35}
+  details.panel>.body{padding:7px 7px 8px}
+
+  #log{font:11px/1.7 ui-monospace,Consolas,monospace;background:#0d0d11;
+       border:1px solid var(--line);border-radius:9px;padding:10px;height:180px;
+       overflow:auto;white-space:pre-wrap;word-break:break-all}
+  #log .t{color:var(--dim)} #log .ok{color:var(--ok)}
+  #log .warn{color:var(--warn)} #log .bad{color:var(--bad)}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>随机播放点赞过的视频</h1>
+  <span class="spacer"></span>
+  <span class="sub" id="qstat"></span>
+  <button id="btn-side">收起左栏</button>
+</header>
+
+<main>
+  <!-- ======================= 左栏：控制 ======================= -->
+  <section>
+    <details class="panel" id="ctrl-panel" open>
+      <summary>播放控制</summary>
+      <div class="body">
+        <div class="stack">
+          <div class="row">
+            <button id="btn-prev" title="上一个 (↑)">◀</button>
+            <button id="btn-next" class="primary" title="下一个 (↓)">▶</button>
+            <button id="btn-random" title="随机跳一个 (R)">🎲</button>
+          </div>
+          <div class="row">
+            <button id="btn-open" title="在抖音打开这条视频，看评论和详情 (O)">↗</button>
+            <button id="btn-full" title="全屏 (F)">⛶</button>
+          </div>
+          <div class="sub" id="progress">队列为空</div>
+          <label class="toggle" title="勾上：播完自动切下一个；不勾：播完循环播放当前这条"><input type="checkbox" id="opt-continue" checked> 连播</label>
+          <label class="toggle" title="切换视频后自动开播"><input type="checkbox" id="opt-autoplay" checked> 自动播放</label>
+          <label class="toggle" title="连播时，一轮走完自动重新洗牌"><input type="checkbox" id="opt-loop" checked> 播完重洗</label>
+          <label class="toggle" title="显示视频文案（左下角浮层）。关掉会连底部渐变遮罩一起去掉"><input type="checkbox" id="opt-caption" checked> 文案</label>
+          <button id="btn-clearlist" style="margin-top:2px">清空队列</button>
+        </div>
+        <div class="keys">
+          <span><kbd>↓</kbd><kbd>↑</kbd> 切换</span>
+          <span><kbd>空格</kbd> 播放/暂停</span>
+          <span><kbd>R</kbd> 随机</span>
+          <span><kbd>O</kbd> 抖音</span>
+          <span><kbd>F</kbd> 全屏</span>
+        </div>
+        <div class="hint">收起来后快捷键照样能用；<b>鼠标滚轮</b>也能切换上下个。</div>
+      </div>
+    </details>
+
+    <details class="panel" id="import-panel" open>
+      <summary>导入 ID</summary>
+      <div class="body">
+        <textarea id="raw" placeholder="把抖音分享链接或视频 ID 粘进来，一行一个或整段粘贴都行：
+
+https://v.douyin.com/iRNBho6G/
+https://www.douyin.com/video/7578091056131901007
+7578091056131901007"></textarea>
+        <div class="row" style="margin-top:8px">
+          <button id="btn-shuffle" class="primary">导入并打乱</button>
+          <button id="btn-parse" style="flex:none">只导入</button>
+        </div>
+        <div class="row" style="margin-top:6px">
+          <button id="btn-merge">增量更新（保留已看进度）</button>
+        </div>
+        <div class="hint" id="parse-hint">
+          支持 <code>v.douyin.com</code> 短链、<code>/video/</code> 长链、<code>modal_id=</code>、裸 ID。
+          <br>又点赞了新的？重新导出列表后点「增量更新」：已在队列里的不动，
+          只把新的追加到末尾，<b>已看进度和当前顺序都不会丢</b>。
+          <br>需要采集新 ID？<a href="/install" target="_blank" style="color:var(--accent)">安装采集脚本</a>
+        </div>
+      </div>
+    </details>
+
+    <details class="panel" id="log-panel">
+      <summary>日志</summary>
+      <div class="body">
+        <div id="log"></div>
+        <div class="row" style="margin-top:8px">
+          <button id="btn-clearlog" style="flex:none">清空日志</button>
+        </div>
+      </div>
+    </details>
+  </section>
+
+  <!-- ======================= 中栏：播放器 ======================= -->
+  <section>
+    <div class="stage">
+      <div class="placeholder" id="placeholder">
+        从左边「导入视频 ID」开始 —— 粘贴一批链接，点「导入并打乱」即可。
+      </div>
+      <div class="phone" id="phone" hidden>
+        <!-- controlsList="nofullscreen"：去掉原生控件里的全屏按钮。
+             因为原生全屏只把 <video> 本身放大，文案浮层（在 .phone 里）不会跟着进去。
+             统一用面板上的 ⛶ 或 F 键全屏，文案才看得见。 -->
+        <canvas class="ambient" id="ambient" width="64" height="36"></canvas>
+        <video id="player" playsinline preload="auto" controls controlsList="nofullscreen"></video>
+        <img id="poster" class="poster" alt="">
+        <div class="scrim"></div>
+        <div class="caption" id="caption"></div>
+      </div>
+    </div>
+    <div class="nowplaying" id="nowplaying"></div>
+  </section>
+</main>
+
+<script>
+(() => {
+  "use strict";
+  const $ = (id) => document.getElementById(id);
+  const player = $("player"), phone = $("phone"), placeholder = $("placeholder");
+  const poster = $("poster");   // 图文贴用的 <img>（视频时隐藏）
+
+  // ---------------------------------------------------------------- 日志
+  const logEl = $("log"), t0 = Date.now();
+  function log(msg, level = "") {
+    const dt = ((Date.now() - t0) / 1000).toFixed(1).padStart(5, " ");
+    const line = document.createElement("div");
+    line.innerHTML = '<span class="t">[' + dt + 's]</span> <span class="' + level + '"></span>';
+    line.lastChild.textContent = msg;
+    logEl.appendChild(line);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  // ---------------------------------------------------------------- 左栏收起/展开
+  // 播放区可用宽度直接由这一栏决定（applyStageSize 量的是 stage.clientWidth），
+  // 所以状态必须尽早落到 DOM 上 —— 晚于启动时那次尺寸测量，视频就会按旧宽度算错。
+  const SIDE_KEY = "tlk_side_off";
+  let sideOff = false;
+  try { sideOff = localStorage.getItem(SIDE_KEY) === "1"; } catch (e) { /* ignore */ }
+
+  function setSideOff(off) {
+    document.body.classList.toggle("side-off", off);
+    const b = $("btn-side");
+    if (b) {
+      b.textContent = off ? "展开左栏" : "收起左栏";
+      b.title = off ? "展开左侧控制栏" : "收起左侧控制栏，把宽度让给播放区";
+      b.setAttribute("aria-expanded", off ? "false" : "true");
+    }
+    try { localStorage.setItem(SIDE_KEY, off ? "1" : "0"); } catch (e) { /* ignore */ }
+  }
+  setSideOff(sideOff);
+
+  // ---------------------------------------------------------------- 状态
+  const state = { queue: [], pos: -1, round: 0 };
+
+  // ---------------------------------------------------------------- 链接解析
+  function extractTargets(text) {
+    const ids = [], shorts = [], seen = new Set();
+    const push = (v, arr) => { if (v && !seen.has(v)) { seen.add(v); arr.push(v); } };
+
+    for (const m of text.matchAll(/https?:\/\/v\.douyin\.com\/[\w-]+\/?/gi)) {
+      push(m[0], shorts);
+    }
+    const rest = text.replace(/https?:\/\/v\.douyin\.com\/[\w-]+\/?/gi, " ");
+
+    const patterns = [
+      /\/video\/(\d{6,25})/g,
+      /modal_id=(\d{6,25})/g,
+      /\/share\/video\/(\d{6,25})/g,
+      /\b(\d{15,25})\b/g,
+    ];
+    for (const p of patterns) {
+      for (const m of rest.matchAll(p)) push(m[1], ids);
+    }
+    return { ids, shorts };
+  }
+
+  // ---------------------------------------------------------------- 标题缓存
+  // 几万条不能一导入就逐条调接口（串行 120ms × 3 万 ≈ 1 小时）。
+  // 改成「播放时才解析 + 结果缓存」，导入变成瞬间完成。
+  let titleCache = {};
+  try { titleCache = JSON.parse(localStorage.getItem("tlk_titles") || "{}") || {}; }
+  catch (e) { titleCache = {}; }
+  let cacheDirty = false;
+  function flushTitleCache() {
+    if (!cacheDirty) return;
+    try { localStorage.setItem("tlk_titles", JSON.stringify(titleCache)); cacheDirty = false; }
+    catch (e) { /* 配额满就算了，不影响播放 */ }
+  }
+  window.addEventListener("beforeunload", flushTitleCache);
+
+  const fmtNum = (n) => Number(n).toLocaleString("en-US");
+
+  // 直链有效期约 3 小时，这里保守取 15 分钟就重新解析
+  const STREAM_TTL = 15 * 60 * 1000;
+
+  function hasFreshStream(item) {
+    return !!(item && item.stream && item.streamAt && (Date.now() - item.streamAt) < STREAM_TTL);
+  }
+
+  /** 解析元信息 + 直链。命中永久性失败会写进缓存，避免反复重试。 */
+  async function fetchMeta(item) {
+    if (!item) return false;
+
+    const c = titleCache[item.id];
+    if (c && !c.ok) {
+      item.status = "fail"; item.errMsg = c.errMsg || "作品不可用";
+      return false;
+    }
+
+    try {
+      const r = await fetch("/api/play?id=" + encodeURIComponent(item.id)).then((x) => x.json());
+      if (!r.ok) {
+        // 服务端用 permanent 标记"确定性失败"（作品被删/仅自己可见/没有可用流）。
+        // 靠错误文案做正则匹配太脆 —— 文案一改就误判。
+        if (r.permanent) {
+          item.status = "fail"; item.errMsg = r.errMsg;
+          titleCache[item.id] = { ok: false, errMsg: r.errMsg }; cacheDirty = true;
+        } else {
+          item.errMsg = r.errMsg;      // 网络/风控类失败保留 unknown，下次还能重试
+        }
+        return false;
+      }
+      item.status = "ok";
+      item.kind = r.kind || "video";       // "video" 或 "images"（图文贴）
+      item.title = r.title || "";
+      item.duration = r.duration || 0;     // ⭐ 秒数用于显示；自动连播靠 video 的 ended 事件
+      item.width = r.width; item.height = r.height;
+      item.stream = r.stream;              // 直链不写进缓存（有时效）
+      item.streamAt = Date.now();
+      item.images = r.images || null;      // 图文：多张图（已转成本地中转地址）
+      item.imageDuration = r.imageDuration || 3000;
+      titleCache[item.id] = {
+        ok: true, title: item.title, d: item.duration,
+        w: r.width, h: r.height, kind: item.kind,
+      };
+      cacheDirty = true;
+      return true;
+    } catch (e) {
+      item.errMsg = "请求异常：" + e.message;   // 保持 unknown，允许重试
+      return false;
+    }
+  }
+
+  /** 播放前用：直链还在有效期内就直接复用，否则重新解析 */
+  async function ensureStream(item) {
+    if (!item) return false;
+    if (hasFreshStream(item)) return true;
+    return await fetchMeta(item);
+  }
+
+  // ---------------------------------------------------------------- 队列持久化
+  // 几千条每次都重新粘贴太烦，导一次就存下来。
+  const QUEUE_KEY = "tlk_queue_v1";
+
+  function saveQueue() {
+    if (!state.queue.length) return;
+    try {
+      localStorage.setItem(QUEUE_KEY, JSON.stringify({
+        v: 1,
+        ids: state.queue.map((x) => x.id).join("\n"),
+        played: state.queue.map((x) => (x.played ? "1" : "0")).join(""),
+        pos: state.pos,
+        round: state.round,
+        savedAt: Date.now(),
+      }));
+    } catch (e) { /* 配额满就放弃持久化，不影响播放 */ }
+  }
+
+  function restoreQueue() {
+    let d = null;
+    try { d = JSON.parse(localStorage.getItem(QUEUE_KEY) || "null"); } catch (e) { return 0; }
+    if (!d || typeof d.ids !== "string") return 0;
+
+    const arr = d.ids.split("\n").filter((x) => /^\d{15,25}$/.test(x));
+    if (!arr.length) return 0;
+
+    const played = String(d.played || "");
+    state.queue = arr.map((id, i) => {
+      const item = { id, title: "", status: "unknown", played: played[i] === "1" };
+      const c = titleCache[id];
+      if (c) {
+        if (c.ok) {
+          // 标题/尺寸可以复用缓存；直链不行（有时效），播的时候再解析
+          item.status = "ok"; item.title = c.title || "";
+          item.duration = c.d || 0;
+          item.width = c.w; item.height = c.h;
+        } else {
+          item.status = "fail"; item.errMsg = c.errMsg || "非公开视频";
+        }
+      }
+      return item;
+    });
+    state.pos = (typeof d.pos === "number" && d.pos >= 0 && d.pos < arr.length) ? d.pos : -1;
+    state.round = d.round || 1;
+    return arr.length;
+  }
+
+  function clearQueue() {
+    state.queue = []; state.pos = -1; state.round = 0;
+    try { localStorage.removeItem(QUEUE_KEY); } catch (e) { /* ignore */ }
+    renderQueue();
+    updateProgress();
+    placeholder.hidden = false;
+    phone.hidden = true;
+    $("caption").textContent = "";
+    $("nowplaying").textContent = "";
+  }
+
+  // ---------------------------------------------------------------- 播放区尺寸
+  // 按视频朝向分别处理，因为两种诉求是冲突的：
+  //   横屏 —— 要尽量大。盒子必须贴合视频比例，否则 contain 会以高度为准、
+  //           左右留空（之前盒子固定 100%×(740 或 74vh)，宽高比 2.31，
+  //           远宽于 16:9，于是 16:9 视频只占 ~77% 宽度）。
+  //   竖屏 —— 要那圈模糊背景。盒子铺满宽度 + 占满可用高度，两侧留白给背景。
+  // 高度不再写死：改成量舞台的实际可用高度（原来写死 740，而可用有 ~947，白扔 200px）。
+  function applyStageSize(item) {
+    const stage = document.querySelector(".stage");
+    if (!stage) return;
+
+    // stage 高度现在由外壳布局给定（flex:1），可以直接量 —— 不会再循环依赖。
+    // stage 已经没有内边距了，所以可用宽高就是它的内容区本身。
+    const availW = Math.max(240, stage.clientWidth || 800);
+    const availH = Math.max(320, stage.clientHeight || 600);
+
+    const w = Number(item && item.width), h = Number(item && item.height);
+    if (!w || !h) {                       // 尺寸还没解析出来，先铺满
+      phone.style.width = "100%";
+      phone.style.height = Math.round(availH) + "px";
+      return;
+    }
+
+    const aspect = w / h;
+    if (aspect >= 1) {
+      // 横屏：让盒子贴合视频比例 —— 视频就能同时撑满宽和高，且不裁切
+      let W = availW, H = W / aspect;
+      if (H > availH) { H = availH; W = H * aspect; }
+      phone.style.width = Math.round(W) + "px";
+      phone.style.height = Math.round(H) + "px";
+    } else {
+      // 竖屏：盒子铺满宽度、占满可用高度，两侧空白留给模糊背景
+      phone.style.width = "100%";
+      phone.style.height = Math.round(availH) + "px";
+    }
+  }
+
+  /** 后台预取往后几条，让「下一个」点下去就能秒播 */
+  function prefetch(from, n) {
+    let started = 0;
+    for (let k = from + 1; k < state.queue.length && started < n; k++) {
+      const it = state.queue[k];
+      if (it && it.status !== "fail" && !hasFreshStream(it)) {
+        started++;
+        fetchMeta(it).then(() => { flushTitleCache(); renderQueue(); });
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------- 队列状态显示
+  // 队列不再用列表展示（列表对"随机看"没帮助，还占地方），
+  // 只在页头显示一个总数 + 失效数量。
+  function renderQueue() {
+    const total = state.queue.length;
+    if (!total) { $("qstat").textContent = ""; return; }
+    let fail = 0;
+    for (let i = 0; i < total; i++) {
+      if (state.queue[i].status === "fail") fail++;
+    }
+    $("qstat").textContent = "共 " + fmtNum(total) + " 个" +
+      (fail ? " · 失效 " + fmtNum(fail) : "");
+  }
+
+  function updateProgress() {
+    const total = state.queue.length;
+    const el = $("progress");
+    if (!total) { el.textContent = "队列为空"; el.title = ""; return; }
+    const played = state.queue.filter((x) => x.played).length;
+    // 正文只留「位置/总数」，完整信息挪到 title 悬停提示里 —— 这样再窄也不会挤断行。
+    // 左栏宽度是 CSS 变量 --side-w，调大之后想把这行加长（例如接上「· 已看 83」）也可以。
+    el.textContent = fmtNum(state.pos + 1) + "/" + fmtNum(total);
+    el.title = "已播 " + fmtNum(played) + " / " + fmtNum(total) +
+               " · 当前位置 " + (state.pos + 1);
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, (c) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  }
+
+  // ---------------------------------------------------------------- 播放
+  let playToken = 0;   // 防止快速连按时旧请求覆盖新视频
+
+  async function play(i) {
+    const item = state.queue[i];
+    if (!item) return;
+    if (item.status === "fail") { log("#" + (i + 1) + " 是非公开视频，跳过", "warn"); return; }
+
+    const token = ++playToken;
+    state.pos = i;
+    item.played = true;
+    renderQueue();
+    updateProgress();
+
+    placeholder.hidden = true;
+    phone.hidden = false;
+    $("caption").textContent = "";
+    $("nowplaying").textContent = "";
+
+    const okNow = await ensureStream(item);
+    if (token !== playToken) return;          // 期间用户已经切走了
+    flushTitleCache();
+    renderQueue();
+
+    if (!okNow) {
+      log("#" + (i + 1) + " " + item.id + " 无法播放：" + (item.errMsg || "未知原因"), "warn");
+      $("nowplaying").innerHTML = "<b>无法播放</b>　" + escapeHtml(item.errMsg || "") +
+        "　" + item.id +
+        '<br><button id="btn-fallback" style="margin-top:8px;flex:none">改用官方播放器打开</button>';
+      const fb = $("btn-fallback");
+      if (fb) fb.addEventListener("click", () => openInOfficialPlayer(item.id));
+      return;
+    }
+
+    applyStageSize(item);
+
+    // 文案浮在画面上（仿抖音）。播放器下方那行不再显示 ID/尺寸/时长 ——
+    // 只保留出错时的提示（那时要给降级按钮）。
+    $("caption").textContent = item.title || "";
+    $("nowplaying").textContent = "";
+
+    if (item.kind === "images" && item.images && item.images.length) {
+      log("图文 #" + (i + 1) + "（" + item.images.length + " 张）→ " +
+          (item.title || item.id).slice(0, 34));
+      showImages(item);
+      saveQueue();
+      prefetch(i, 3);
+      return;
+    }
+
+    stopImages();                              // 从图文切回视频，得把翻页定时器停掉
+    phone.classList.remove("show-image");
+    log("播放 #" + (i + 1) + " → " + (item.title || item.id).slice(0, 40));
+
+    // 换片：直接换 src 并尝试自动播放。
+    // 自动播放需要用户手势（按键/点击都算），失败时 video.play() 的 Promise 会拒绝。
+    swapSource(item.stream);
+    if ($("opt-autoplay").checked) {
+      const p = player.play();
+      if (p && typeof p.catch === "function") {
+        p.catch((e) => log("自动播放被拦（" + e.name + "）—— 点一下视频即可", "warn"));
+      }
+    }
+
+    saveQueue();
+    prefetch(i, 3);
+  }
+
+  // 换源：换 src 会让浏览器停掉旧播放 → 触发 pause → Chrome 在暂停时会弹出控制条，
+  // 那就是切条时闪出来的"进度条"。
+  //
+  // 做法：换源期间摘掉 controls，而且【不主动装回】—— 等用户动鼠标 / 按下指针时再装。
+  //   上一版是 playing 一触发就装回，结果 Chrome 在控件刚被启用时自己又会亮一下，
+  //   等于把那次闪烁从"换源时"挪到了"开播时"。
+  //   而要用进度条，本来就必须把鼠标移过去 —— 所以"动鼠标才出现"完全够用，不会误伤。
+  //   点画面播放/暂停、F 全屏、↑↓ 切换都不依赖原生控件，所以控件晚点出现没影响。
+  function swapSource(url) {
+    player.removeAttribute("controls");
+    player.src = url;
+    player.load();
+
+    const restore = () => {
+      if (!player.hasAttribute("controls")) {
+        player.setAttribute("controls", "");   // controlsList="nofullscreen" 仍保留
+      }
+    };
+    ["mousemove", "pointerdown"].forEach((ev) => {
+      if (stageEl) stageEl.addEventListener(ev, restore, { once: true, passive: true });
+    });
+  }
+
+  // ---------------------------------------------------------------- 图文贴播放
+  // 图文没有视频流，用 <img> 逐张显示，每张停留 item.imageDuration 毫秒。
+  // 走完之后和视频一样交给「连播」开关决定：切下一个 or 重看这组。
+  let imageTimer = null;
+
+  function stopImages() {
+    clearTimeout(imageTimer);
+    imageTimer = null;
+  }
+
+  function showImages(item) {
+    stopImages();
+    player.pause();
+    phone.classList.add("show-image");
+    applyStageSize(item);        // 按第一张图的宽高比定播放区形状
+
+    const total = item.images.length;
+    let idx = 0;
+
+    const step = () => {
+      $("poster").src = item.images[idx];
+      idx++;
+      if (idx < total) {
+        imageTimer = setTimeout(step, item.imageDuration || 3000);
+      } else {
+        imageTimer = setTimeout(() => {
+          if (!$("opt-continue").checked) { showImages(item); return; }   // 不连播 → 重看这组
+          const n = nextIndex();
+          if (n >= 0) { log("图文看完，自动切下一个", "ok"); play(n); }
+          else log("已经是最后一个了", "warn");
+        }, item.imageDuration || 3000);
+      }
+    };
+    step();
+  }
+
+  /** 降级：直链拿不到时，用官方 iframe 播放器打开这一条 */
+  function openInOfficialPlayer(id) {
+    const url = "https://open.douyin.com/player/video?vid=" + encodeURIComponent(id) + "&autoplay=0";
+    log("改用官方播放器打开（新标签页）");
+    window.open(url, "_blank", "noopener");
+  }
+
+  /** 在抖音打开这条视频。
+   *  用 modal_id 参数 —— 抖音会把它以弹层形式浮在「喜欢」列表上，
+   *  所以评论、详情、作者主页全都在，看完关掉弹层就回到列表。 */
+  function openOnDouyin(id) {
+    if (!id) { log("还没有正在播放的视频", "warn"); return; }
+    const url = "https://www.douyin.com/user/self?from_tab_name=main&modal_id=" +
+                encodeURIComponent(id) + "&showTab=like";
+    log("在抖音打开：" + id);
+    window.open(url, "_blank", "noopener");
+  }
+
+  function openCurrentOnDouyin() {
+    const item = state.queue[state.pos];
+    openOnDouyin(item && item.id);
+  }
+
+  function okIndices() {
+    // 尚未解析的也算"可用"，这样没解析完整列表时随机/下一个照样能工作
+    return state.queue.map((x, i) => (x.status === "fail" ? -1 : i)).filter((i) => i >= 0);
+  }
+
+  function nextIndex() {
+    const okIdx = okIndices();
+    if (!okIdx.length) return -1;
+    const cur = okIdx.indexOf(state.pos);
+    const next = cur + 1;
+    if (next < okIdx.length) return okIdx[next];
+    if (!$("opt-loop").checked) return -1;
+    return shuffleRound(okIdx);
+  }
+
+  function shuffleRound(okIdx) {
+    state.round += 1;
+    const order = shuffle(okIdx.slice());
+    if (order.length > 1 && order[0] === state.pos) {
+      [order[0], order[1]] = [order[1], order[0]];
+    }
+    const byIdx = new Map(state.queue.map((x, i) => [i, x]));
+    state.queue = order.map((i) => byIdx.get(i));
+    state.queue.forEach((x) => { x.played = false; });
+    state.pos = -1;
+    log("第 " + state.round + " 轮开始，已重新洗牌", "ok");
+    renderQueue();
+    return 0;
+  }
+
+  function shuffle(a) {
+    for (let i = a.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [a[i], a[j]] = [a[j], a[i]];
+    }
+    return a;
+  }
+
+  // ---------------------------------------------------------------- 导入
+  // 解析 textarea 里的链接/裸 ID，并把短链展开成 ID。
+  // 三个导入按钮（打乱 / 只导入 / 增量更新）共用这一步。
+  async function collectIdsFromText() {
+    const text = $("raw").value.trim();
+    if (!text) { log("先粘贴一些链接吧", "warn"); return null; }
+
+    const { ids, shorts } = extractTargets(text);
+    log("识别到 " + ids.length + " 个长链/裸 ID，" + shorts.length + " 个短链");
+
+    const resolvedShorts = [];
+    for (const s of shorts) {
+      try {
+        const r = await fetch("/api/expand?url=" + encodeURIComponent(s)).then((x) => x.json());
+        if (r.ok) { resolvedShorts.push(r.id); log("短链展开 → " + r.id, "ok"); }
+        else log("短链失败：" + r.errMsg, "bad");
+      } catch (e) { log("短链请求异常：" + e.message, "bad"); }
+    }
+
+    const allIds = [...new Set([...resolvedShorts, ...ids])];
+    if (!allIds.length) log("没识别出任何视频 ID，检查一下粘贴内容", "bad");
+    return allIds.length ? allIds : null;
+  }
+
+  // 按缓存的标题信息补全一个新 item（直链有时效，不能复用，播放时再解析）
+  function makeItem(id) {
+    const item = { id, title: "", status: "unknown" };
+    const c = titleCache[id];
+    if (c) {
+      if (c.ok) {
+        item.status = "ok"; item.title = c.title || "";
+        item.duration = c.d || 0;
+        item.width = c.w; item.height = c.h;
+      } else {
+        item.status = "fail"; item.errMsg = c.errMsg || "非公开视频";
+      }
+    }
+    return item;
+  }
+
+  function setImportBusy(b) {
+    $("btn-shuffle").disabled = $("btn-parse").disabled = $("btn-merge").disabled = b;
+  }
+
+  // 增量更新：只追加队列里还没有的 ID，保留原有顺序与「已看」标记。
+  // 场景：抖音上又点赞了几条 → 重新采集导出的是「旧 5,398 + 新增」的完整列表。
+  // 直接走「导入并打乱」会把 played 位图整个替换掉，看过的几千条会被重播一遍。
+  async function mergeFromText() {
+    const allIds = await collectIdsFromText();
+    if (!allIds) return;
+    setImportBusy(true);
+
+    const known = new Set(state.queue.map((x) => x.id));
+    const added = [];
+    for (const id of allIds) {
+      if (known.has(id)) continue;
+      known.add(id);
+      added.push(makeItem(id));
+    }
+
+    const before = state.queue.length;
+
+    // 队列本来是空的 → 等价于首次导入，直接从第一个开始播
+    if (!before) {
+      state.queue = added;
+      state.pos = -1; state.round = 1;
+      renderQueue(); updateProgress(); saveQueue();
+      setImportBusy(false);
+      log("队列已建好：共 " + fmtNum(added.length) + " 个", "ok");
+      play(0);
+      return;
+    }
+
+    if (!added.length) {
+      setImportBusy(false);
+      log("没有新增：这 " + fmtNum(allIds.length) + " 个 ID 全都已经在队列里了，" +
+          "队列仍是 " + fmtNum(before) + " 个", "ok");
+      return;
+    }
+
+    // 只往末尾 push：前面每一项的下标不变，所以 state.pos 依然指向原来那条
+    state.queue.push(...added);
+    renderQueue(); updateProgress(); saveQueue();
+    setImportBusy(false);
+
+    log("增量更新：新增 " + fmtNum(added.length) + " 个，队列 " +
+        fmtNum(before) + " → " + fmtNum(state.queue.length) +
+        " 个，已看进度和当前顺序都保留了", "ok");
+    log("新 ID 排在队列末尾，本轮播完才轮到；开了「播完重洗」的话下一轮就会混在一起。");
+  }
+
+  async function importFromText(doShuffle) {
+    const allIds = await collectIdsFromText();
+    if (!allIds) return;
+    setImportBusy(true);
+
+    // 只建队列，不逐条调接口 —— 几万条在这里也是瞬间完成。
+    // 标题/可播性等真正播放时再解析，结果会缓存到 localStorage。
+    state.queue = allIds.map((id) => ({ id, title: "", status: "unknown" }));
+    state.pos = -1; state.round = 1;
+    if (doShuffle) { shuffle(state.queue); log("已随机打乱 " + fmtNum(state.queue.length) + " 个视频"); }
+
+    const cached = state.queue.filter((x) => titleCache[x.id]).length;
+    renderQueue();
+    updateProgress();
+    saveQueue();
+    setImportBusy(false);
+
+    log("队列已建好：共 " + fmtNum(state.queue.length) + " 个" +
+        (cached ? "（其中 " + fmtNum(cached) + " 个有缓存标题）" : ""), "ok");
+    log("标题改为「播放时按需解析」，所以导入是瞬时的，几万条也不会卡。");
+    log("开始播放", "ok");
+    play(0);
+  }
+
+  // ---------------------------------------------------------------- 事件
+  $("btn-shuffle").addEventListener("click", () => importFromText(true));
+  $("btn-parse").addEventListener("click", () => importFromText(false));
+  $("btn-merge").addEventListener("click", mergeFromText);
+  $("btn-next").addEventListener("click", () => {
+    const i = nextIndex();
+    if (i >= 0) play(i); else log("没有下一个了", "warn");
+  });
+  $("btn-prev").addEventListener("click", () => {
+    const okIdx = okIndices();
+    const cur = okIdx.indexOf(state.pos);
+    if (cur > 0) play(okIdx[cur - 1]); else log("已经是第一个了", "warn");
+  });
+  $("btn-random").addEventListener("click", () => {
+    const okIdx = okIndices();
+    if (okIdx.length < 2) { log("至少要有 2 个可用视频才能随机跳", "warn"); return; }
+    let i;
+    do { i = okIdx[Math.floor(Math.random() * okIdx.length)]; } while (i === state.pos && okIdx.length > 1);
+    play(i);
+  });
+  $("btn-clearlist").addEventListener("click", () => {
+    if (!state.queue.length) { log("队列本来就是空的", "warn"); return; }
+    if (!confirm("清空当前队列（共 " + fmtNum(state.queue.length) + " 个）？\n\n标题缓存会保留，下次导入同样的 ID 依然很快。")) return;
+    clearQueue();
+    log("已清空队列和本地保存", "ok");
+  });
+  // 播放区尺寸现在是纯 CSS（100% 宽 + min(740px,74vh) 高），
+  // 窗口变化会自动跟着变，不需要 JS 重算。
+
+  // ------------------------------------------------ 模糊背景（仿抖音全屏两侧）
+  // 把当前视频帧画进一张 64×36 的小 canvas，再交给 CSS 放大 + 重模糊。
+  // 为什么不用第二个 <video>：省一份解码。为什么不用封面图：颜色会跟着画面动。
+  // 限流到 ~8fps —— 这是背景装饰，不需要跟着视频满帧。
+  const ambient = $("ambient");
+  const ambientCtx = ambient.getContext("2d");
+  let ambientLogged = 0;   // 0=未记录 1=已成功记录 2=已失败记录
+
+  // 只在「这一条视频的第一帧就绪」时画一次，之后完全不动。
+  // 不做实时更新 —— 背景只是配色，跟着画面动没有意义，还白费 CPU。
+  function drawAmbientOnce() {
+    if (!player.videoWidth) return;
+    const vw = player.videoWidth, vh = player.videoHeight;
+    const cw = ambient.width, ch = ambient.height;
+    // 按 cover 铺满 canvas 并居中，多余部分裁掉（画到 canvas 外的会被自动裁）
+    const s = Math.max(cw / vw, ch / vh);
+    const dw = vw * s, dh = vh * s;
+    try {
+      // 视频流经本地服务同源中转，所以这里不会污染 canvas
+      ambientCtx.drawImage(player, (cw - dw) / 2, (ch - dh) / 2, dw, dh);
+      if (ambientLogged !== 1) { ambientLogged = 1; log("模糊背景已取样（" + vw + "×" + vh + "）", "ok"); }
+    } catch (e) {
+      if (ambientLogged !== 2) { ambientLogged = 2; log("模糊背景绘制失败：" + e.message, "bad"); }
+    }
+  }
+
+  // loadeddata = 第一帧已可用；换视频会重新触发，所以每条都会重新取色
+  player.addEventListener("loadeddata", drawAmbientOnce);
+
+  // ------------------------------------------------ 播放器事件
+  // 播完自动下一个 —— 这是原生 <video> 才有的能力（官方 iframe 播放器给不了）
+  // 注意：没勾「连播」时 player.loop 会被打开，那时 ended 根本不会触发，
+  //       所以这里不需要再判断 opt-continue。
+  player.addEventListener("ended", () => {
+    const n = nextIndex();
+    if (n >= 0) { log("播完，自动切下一个", "ok"); play(n); }
+    else log("已经是最后一个了", "warn");
+  });
+
+  // 「连播」开关：不勾就把 <video> 自己的 loop 打开。
+  // 用原生 loop 而不是在 ended 里 currentTime=0 + play()：
+  //   原生循环是无缝的，自己重播会闪一下黑（视频要重新定位到 0）。
+  function applyContinueOpt() {
+    player.loop = !$("opt-continue").checked;
+  }
+  $("opt-continue").addEventListener("change", () => {
+    applyContinueOpt();
+    log(player.loop ? "关闭连播，将循环播放当前视频" : "开启连播，播完切下一个", "ok");
+  });
+  applyContinueOpt();
+
+  // 「文案」开关：关掉时给 .phone 加 no-caption，由 CSS 同时隐藏文案和遮罩
+  function applyCaptionOpt() {
+    phone.classList.toggle("no-caption", !$("opt-caption").checked);
+  }
+  $("opt-caption").addEventListener("change", () => {
+    applyCaptionOpt();
+    log($("opt-caption").checked ? "显示文案" : "隐藏文案", "ok");
+  });
+  applyCaptionOpt();
+
+  // 直链有有效期（约 3 小时）。出错时重新解析一次再试，避免"看着看着就播不动"
+  let lastErrRetry = 0;
+  player.addEventListener("error", async () => {
+    const item = state.queue[state.pos];
+    if (!item) return;
+    const now = Date.now();
+    if (now - lastErrRetry < 3000) return;   // 别疯狂重试
+    lastErrRetry = now;
+    log("播放出错（直链可能过期），重新解析后重试…", "warn");
+    item.stream = null; item.streamAt = 0;
+    const ok = await ensureStream(item);
+    if (!ok) { log("重新解析失败：" + (item.errMsg || "未知原因"), "bad"); return; }
+    swapSource(item.stream);      // 和正常换片走同一条路，避免控制条闪出来
+    player.play().catch(() => {});
+  });
+
+  // 原来的「键盘焦点回收」整块删掉了 —— 那是跨域 iframe 才有的问题。
+  // 现在播放器是原生 <video>，就在我们自己的文档里，焦点不会被抢走。
+  // 唯一的注意点：<video> 获得焦点时，方向键默认是"快进/快退"，
+  // 下面的 keydown 里用 preventDefault() 把它改成"上一个/下一个"。
+
+  // ------------------------------------------------ 全屏
+  const stageEl = document.querySelector(".stage");
+
+  /** 空格：播放 / 暂停。
+   *  自己实现而不是放给原生控件 —— 原生只在 <video> 有焦点时才响应空格，
+   *  从别处点一下焦点就跑掉了。自己处理则任何时候都灵。 */
+  function togglePlay() {
+    if (!player.src) return;
+    if (player.paused) player.play().catch(() => {});
+    else player.pause();
+  }
+
+  function toggleFullscreen() {
+    if (document.fullscreenElement) {
+      document.exitFullscreen().catch(() => {});
+    } else if (stageEl && stageEl.requestFullscreen) {
+      stageEl.requestFullscreen().catch((e) => log("全屏失败：" + e.message, "warn"));
+    }
+  }
+
+  $("btn-full").addEventListener("click", toggleFullscreen);
+  $("btn-open").addEventListener("click", openCurrentOnDouyin);
+
+  // ------------------------------------------------ 点击画面 = 播放 / 暂停
+  // 原生控件在自己的 shadow DOM 里，点它们的事件同样会冒泡到 <video> 上。
+  // 所以要用 composedPath()[0] 判断点击实际落在哪 —— 落在控件上就不接管，
+  // 否则会和控件自身的行为打架（表现成"点了没反应"）。
+  player.addEventListener("click", (e) => {
+    const path = typeof e.composedPath === "function" ? e.composedPath() : [];
+    if (path.length && path[0] !== player) return;   // 点在原生控件上
+    togglePlay();
+  });
+
+  // ------------------------------------------------ 控制条显隐 → 文案升降
+  // 原生控制条的显隐状态在 shadow DOM 里，JS 读不到，只能按浏览器行为近似。
+  // 关键：原生控制条【只在鼠标活动时出现】，换视频（改 src）并不会让它出现。
+  //   ⚠️ 之前把"升起"也绑在 play 事件上 —— 换视频时文案会先升上去、
+  //      3 秒后再落下来，而底下根本没有控制条，中间那段是悬空的。
+  // 所以拆成两个动作：
+  //   升起 = 只有鼠标动了才做（那时控制条确实出现了）
+  //   安排落下 = 播放中随时可以安排（不主动升起）
+  let ctrlTimer = null;
+
+  function controlsHideSoon() {
+    clearTimeout(ctrlTimer);
+    ctrlTimer = setTimeout(() => {
+      // 暂停时原生控制条不会隐藏，所以只在播放中才把它当作已收起
+      if (!player.paused && !player.ended && player.readyState > 0) {
+        phone.classList.add("ctrl-hidden");
+      }
+    }, 3000);
+  }
+
+  function controlsAppear() {
+    phone.classList.remove("ctrl-hidden");
+    controlsHideSoon();
+  }
+
+  ["mousemove", "pointerdown", "touchstart"].forEach((ev) => {
+    if (stageEl) stageEl.addEventListener(ev, controlsAppear, { passive: true });
+  });
+
+  // 换视频时只"安排落下"、不"升起" —— 万一上一条是暂停状态把文案升着，
+  // 这里能让它在该落的时候落回去。
+  player.addEventListener("play", controlsHideSoon);
+
+  // ⚠️ 这里【故意没有】pause 监听。
+  //   Chrome 在暂停时会弹控制条，所以"用户按了暂停 → 文案该升上去"听起来合理，
+  //   但换 src 时浏览器也会先停掉旧播放、发一个 pause —— 那个 pause 不是用户按的。
+  //   结果就是切条时文案升上去、3 秒后再落下来，还会闪一下控制条。
+  //   而用户主动暂停（点击/空格）本身就会走 controlsAppear（pointerdown）或下面的
+  //   togglePlay，不需要靠 pause 事件来补。
+  //   另外 controlsHideSoon 里已经判断了 player.paused：暂停时那 3 秒到期不会收起，
+  // 双击视频也走我们的全屏（否则 Chrome 会只把 <video> 放大，文案就丢了）
+  // 双击画面 = 全屏。绑在 .phone 容器上 —— 这样视频和图文（<img>）都覆盖到，
+  // 之前只绑在 <video> 上，双击图片没反应。
+  // 用 composedPath 排除原生控件：双击控件不该触发全屏。
+  // 对 <video> 必须 preventDefault，否则 Chrome 会自己把 video 放大，文案就丢了。
+  phone.addEventListener("dblclick", (e) => {
+    const path = typeof e.composedPath === "function" ? e.composedPath() : [];
+    const onPicture = path.length === 0 ||
+                      path[0] === player || path[0] === poster || path[0] === phone;
+    if (!onPicture) return;
+    e.preventDefault();
+    toggleFullscreen();
+  });
+  document.addEventListener("fullscreenchange", () => {
+    const on = !!document.fullscreenElement;
+    $("btn-full").textContent = on ? "⛶ 退出全屏" : "⛶ 全屏";
+    log(on ? "已进入全屏" : "已退出全屏");
+    // 全屏后把焦点从 <video> 上挪开，别让原生控件抢先处理方向键。
+    // （捕获阶段已经能挡住，这是第二道保险）
+    try { player.blur(); } catch (e) { /* ignore */ }
+  });
+
+  // ⚠️ 必须用「捕获阶段」+ stopPropagation：
+  //   原生 <video controls> 自带键盘处理（方向键=快进/快退、空格=播放/暂停），
+  //   监听器在 video 的 shadow DOM 里。挂冒泡阶段的话，事件从 shadow 冒上来时
+  //   原生控件已经处理完了 —— 这正是「非全屏能按、全屏按不动」的原因
+  //   （全屏时 video 持有焦点，原生控件才参与）。
+  //   捕获阶段是从 document 往 target 走，挂在 document 上会先执行，
+  //   一 stopPropagation，原生控件就收不到这几个键了。
+  document.addEventListener("keydown", (e) => {
+    if (e.target && (e.target.tagName === "TEXTAREA" || e.target.tagName === "INPUT")) return;
+
+    let handled = true;
+    switch (e.key) {
+      case "ArrowDown":  $("btn-next").click(); break;  // ↓ 下一个（与滚轮方向一致）
+      case "ArrowUp":    $("btn-prev").click(); break;  // ↑ 上一个
+      case " ":          togglePlay(); break;           // 播放 / 暂停
+      case "r": case "R": $("btn-random").click(); break;  // 随机跳
+      case "o": case "O": openCurrentOnDouyin(); break;    // 在抖音打开当前这条
+      case "f": case "F": toggleFullscreen(); break;
+      default: handled = false;
+    }
+    if (handled) {
+      e.preventDefault();      // 阻止原生控件的默认行为（快进/快退/播放暂停）
+      e.stopPropagation();     // 别让事件继续传到 shadow DOM 里的原生控件
+    }
+  }, true);
+
+  // ------------------------------------------------ 滚轮切换视频
+  // 只绑在播放区上，不绑全页 —— 否则左栏内部滚动会被吃掉。
+  // passive:false 是必须的，不然 preventDefault() 无效、页面还是会滚。
+  // 触控板一次滑动会连发几十个 wheel 事件，所以「幅度阈值 + 冷却」两道闸。
+  let lastWheel = 0;
+  const WHEEL_COOLDOWN = 500;   // ms，约合每秒切 2 个
+  const WHEEL_MIN_DELTA = 4;    // 小于这个幅度当抖动忽略
+
+  document.querySelector(".stage").addEventListener("wheel", (e) => {
+    e.preventDefault();
+    if (Math.abs(e.deltaY) < WHEEL_MIN_DELTA) return;
+    const now = Date.now();
+    if (now - lastWheel < WHEEL_COOLDOWN) return;
+    lastWheel = now;
+    if (e.deltaY > 0) $("btn-next").click();      // 往下滚 → 下一个
+    else $("btn-prev").click();                   // 往上滚 → 上一个
+  }, { passive: false });
+
+  $("btn-clearlog").addEventListener("click", () => { logEl.innerHTML = ""; });
+
+  // 窗口尺寸变了、或者左栏收起/展开，播放区可用空间都会跟着变 —— 得重算。
+  // 用 rAF 合并连续的变化，避免拖动窗口时每像素都重排。
+  let relayoutRaf = null;
+  function relayout() {
+    if (relayoutRaf) cancelAnimationFrame(relayoutRaf);
+    relayoutRaf = requestAnimationFrame(() => {
+      relayoutRaf = null;
+      applyStageSize(state.queue[state.pos]);
+    });
+  }
+  window.addEventListener("resize", relayout);
+
+  // 切换左栏。只改 class + 重新量尺寸：队列、播放进度、当前视频一概不动。
+  $("btn-side").addEventListener("click", () => {
+    sideOff = !sideOff;
+    setSideOff(sideOff);
+    relayout();
+  });
+
+  // ---------------------------------------------------------------- 启动
+  const restored = restoreQueue();
+  if (restored) {
+    renderQueue();
+    updateProgress();
+    // 已经有队列了，把「导入」收起来，界面留给播放
+    const ip = $("import-panel");
+    if (ip) ip.open = false;
+    const where = state.pos >= 0 ? "，上次看到第 " + fmtNum(state.pos + 1) + " 个" : "";
+    log("已恢复上次的队列：共 " + fmtNum(restored) + " 个" + where, "ok");
+    if (state.pos >= 0 && state.queue[state.pos] && state.queue[state.pos].status === "ok") {
+      play(state.pos);
+    }
+  } else {
+    log("就绪。先在左边「导入视频 ID」里粘一批链接。");
+  }
+  // ---------------------------------------------------------------- 折叠状态
+  // 记住每个可折叠面板的开合，下次打开保持原样。
+  // 放在启动逻辑之后执行 —— 这样用户的偏好优先于"有队列就自动收起导入"那一步。
+  document.querySelectorAll("details.panel").forEach((d) => {
+    const key = "tlk_open_" + (d.id || "x");
+    try {
+      const saved = localStorage.getItem(key);
+      if (saved !== null) d.open = saved === "1";
+    } catch (e) { /* ignore */ }
+    d.addEventListener("toggle", () => {
+      try { localStorage.setItem(key, d.open ? "1" : "0"); } catch (e) { /* ignore */ }
+    });
+  });
+})();
+</script>
+</body>
+</html>

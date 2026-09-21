@@ -1,0 +1,21 @@
+# 导出的点赞数据 —— 个人数据，不要进仓库
+douyin-likes-*.txt
+douyin-likes-*.json
+*.sqlite
+*.db
+
+# 依赖
+node_modules/
+
+# 临时/调试脚本（开发过程中产生的一次性文件）
+_*.mjs
+_*.js
+_t.bat
+*.log
+
+# 系统 / 编辑器
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
