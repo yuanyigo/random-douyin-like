@@ -543,6 +543,27 @@ https://www.douyin.com/video/7578091056131901007
     }
   }
 
+  /** 预载某条图文贴的头图（只下第一张）。
+   *
+   *  为什么值得：图片走本地 /api/stream 中转，实测要 700ms 上下才到手，而这期间
+   *  播放区是空的（切条目时 poster 的 src 必须清掉，否则会残留上一条那张图）。
+   *  提前把图下载 + 解码一次，点「下一个」时它在缓存里，赋值即出画。
+   *
+   *  只预载头图：组内第 2 张起，用户至少要看 3 秒才轮到，那点下载时间无所谓。
+   *  另外用 preloadedHeads 去重 —— 预载只该在「还没见过这张图」时发生一次。 */
+  const preloadedHeads = new Set();
+
+  function preloadHead(item) {
+    if (!item || item.kind !== "images") return;
+    const url = item.images && item.images[0];
+    if (!url || preloadedHeads.has(url)) return;
+    const pre = new Image();
+    pre.decoding = "async";
+    // 只有真下载成功才记账：失败不记，下次还有机会重试
+    pre.onload = () => preloadedHeads.add(url);
+    pre.src = url;
+  }
+
   /** 后台预取往后几条，让「下一个」点下去就能秒播 */
   function prefetch(from, n) {
     let started = 0;
@@ -550,7 +571,11 @@ https://www.douyin.com/video/7578091056131901007
       const it = state.queue[k];
       if (it && it.status !== "fail" && !hasFreshStream(it)) {
         started++;
-        fetchMeta(it).then(() => { flushTitleCache(); renderQueue(); });
+        fetchMeta(it).then(() => {
+          flushTitleCache();
+          renderQueue();
+          preloadHead(it);      // 图文贴：把头图也一并预载掉
+        });
       }
     }
   }
@@ -636,7 +661,12 @@ https://www.douyin.com/video/7578091056131901007
       return;
     }
 
-    stopImages();                              // 从图文切回视频，得把翻页定时器停掉
+    // 从图文切回视频：把 <img> 上那张图丢掉。
+    // ⚠️ 必须一起清 src —— .poster 平时靠 CSS display:none 藏起来，但
+    //    一旦再切回任何图文，.show-image 一加上它立刻可见，那时新图还没下载完，
+    //    屏幕上留着的就是上一次那张旧图。
+    stopImages();
+    poster.removeAttribute("src");
     phone.classList.remove("show-image");
     log("播放 #" + (i + 1) + " → " + (item.title || item.id).slice(0, 40));
 
@@ -677,38 +707,129 @@ https://www.douyin.com/video/7578091056131901007
     });
   }
 
+  /** 彻底摘掉视频源。
+   *  为什么需要：只把 src 留着而流拿不到时，Chrome 会在 <video> 的左上角画一个
+   *  破图/破媒体图标（和 <img> 加载失败那个占位同款）。既然这条已经放弃了，
+   *  就把源一起清掉，宁可留黑。removeAttribute + load() 是让浏览器真正释放
+   *  旧源的标准做法，只清属性不调 load() 有些版本还会继续显示上一帧。 */
+  function dropVideoSource() {
+    player.removeAttribute("src");
+    try { player.load(); } catch (e) { /* ignore */ }
+  }
+
   // ---------------------------------------------------------------- 图文贴播放
   // 图文没有视频流，用 <img> 逐张显示，每张停留 item.imageDuration 毫秒。
-  // 走完之后和视频一样交给「连播」开关决定：切下一个 or 重看这组。
+  // 和视频一样交给「连播」开关决定：走完切下一个 or 重看这组。
   let imageTimer = null;
+  // 每换一条图文就 +1。异步回调（翻页 / 预载 / onerror）回来时先对一下这个号，
+  // 号对不上说明用户已经切走，直接丢弃 —— 否则旧条目的回调会改到新条目的画面。
+  let posterToken = 0;
 
   function stopImages() {
     clearTimeout(imageTimer);
     imageTimer = null;
+    posterToken++;        // 让所有在途回调失效
+  }
+
+  /** 换 <img> 的地址，并且只在确认新图能画出来之后才动它。
+   *
+   *  ⚠️ 这里不能用「先清空 src 再赋新值」：src 一换，浏览器会把 <img> 当成
+   *     还没有可用图像，画面立刻变空。图片走本地 /api/stream 中转（响应是
+   *     no-store），实测每次要 700ms 上下，清空的话就是七百毫秒黑屏。
+   *
+   *  也不能只写 src 就完事：src 变了但新图还在路上时，屏幕上留着的仍是上一条
+   *  （图文→视频→下一个图文）。「图文 B 的标题都出来了，画面还是上一个图文的图」
+   *  就是这么来的。
+   *
+   *  所以：先拿一个游离的 Image 把新图下载 + 解码完，再一次性把 poster.src 定过去。
+   *  解码过的图已经在内存缓存里，赋值是同步出画的，既不黑屏也不残留旧图。
+   *
+   *  ⚠️ 失败时【绝对不能】把 URL 写进 poster.src：写上去而图下不来，浏览器会在
+   *     左上角画那个破图占位（Chrome 的 broken-image 图标）。所以只在 onload
+   *     里渲染，onerror 走 onFail —— 上一个画面留着，比露个破图强。
+   *
+   *  ok 才是「真的画出来了」，只有它才允许安排下一次翻页。 */
+  function setPoster(url, token, ok, fail) {
+    // ⚠️ 关键：新图没准备好之前，poster 必须处于「隐藏」状态。
+    //    .phone.show-image 一加上，poster 立刻可见；这时它身上要么是上一张
+    //    旧图、要么是个还没画出来的 src —— Chrome 在「有 src 但还没有可用
+    //    图像」的那段时间会在元素左上角画破图占位，就是这个图标。
+    //    先摘掉类把画面让出来（黑场），等图片真解码完再显示，占位就没机会出现。
+    phone.classList.remove("show-image");
+    const pre = new Image();
+    pre.decoding = "async";
+    pre.onload = () => {
+      if (token !== posterToken) return;      // 期间切走了，这张图作废
+      poster.src = url;
+      // 等「这一张」解码完才允许显示。decode() 在图片已可用时很快返回，
+      // 所以这个黑场只有几帧；而它换来的是「绝不出现破图占位」。
+      const show = () => {
+        if (token !== posterToken) return;
+        phone.classList.add("show-image");
+        ok();
+      };
+      if (poster.decode) poster.decode().then(show, show);
+      else show();
+    };
+    pre.onerror = () => {
+      if (token !== posterToken) return;
+      fail();
+    };
+    pre.src = url;
   }
 
   function showImages(item) {
     stopImages();
+    const token = posterToken;
     player.pause();
-    phone.classList.add("show-image");
+    // 这里【不】加 show-image —— 由 setPoster 在第一张解码完成后才加，
+    // 否则会出现「类已加上、图还没到」的空档（见 setPoster 里的说明）。
     applyStageSize(item);        // 按第一张图的宽高比定播放区形状
 
     const total = item.images.length;
-    let idx = 0;
+    let idx = 0;                 // 正在处理第几张（0 基），失败时靠它报号
+    let cur = "";                // 当前这张的地址
+    let retried = false;         // 同一张只重试一次
 
     const step = () => {
-      $("poster").src = item.images[idx];
-      idx++;
-      if (idx < total) {
-        imageTimer = setTimeout(step, item.imageDuration || 3000);
-      } else {
-        imageTimer = setTimeout(() => {
-          if (!$("opt-continue").checked) { showImages(item); return; }   // 不连播 → 重看这组
-          const n = nextIndex();
-          if (n >= 0) { log("图文看完，自动切下一个", "ok"); play(n); }
-          else log("已经是最后一个了", "warn");
-        }, item.imageDuration || 3000);
-      }
+      cur = item.images[idx];
+      const no = idx + 1;
+      // 组内翻页：等新图解码完再换，中间不会闪一下空白
+      setPoster(cur, token, () => {
+        if (token !== posterToken) return;
+        idx++;                   // 这张画出来了，才推进到下一张
+        retried = false;
+        // 每张的停留时间从「真的显示出来」开始算
+        imageTimer = setTimeout(afterDwell, item.imageDuration || 3000);
+      }, () => {
+        if (token !== posterToken) return;
+        // 只重试一次：同一张连续两次拿不到就判定它坏了，跳过
+        if (!retried) {
+          retried = true;
+          log("图文第 " + no + " 张下载失败，重试一次…", "warn");
+          step();
+          return;
+        }
+        log("图文第 " + no + " 张仍然失败，跳过", "warn");
+        retried = false;
+        idx++;
+        if (idx < total) { step(); return; }
+        // 整组都没下来：什么都不渲染（宁可不画，也不能露破图占位），
+        // 留一行文案给用户一个交代
+        $("caption").textContent =
+          (total > 1 ? "这组图都加载失败了" : "这张图加载失败了") +
+          "　" + (item.title || item.id);
+      });
+    };
+
+    const afterDwell = () => {
+      if (token !== posterToken) return;
+      if (idx < total) { step(); return; }     // 还有下一张
+      // 整组看完 —— 和视频一样交给「连播」开关决定：切下一个 or 重看这组
+      if (!$("opt-continue").checked) { showImages(item); return; }
+      const n = nextIndex();
+      if (n >= 0) { log("图文看完，自动切下一个", "ok"); play(n); }
+      else log("已经是最后一个了", "warn");
     };
     step();
   }
@@ -990,7 +1111,11 @@ https://www.douyin.com/video/7578091056131901007
     log("播放出错（直链可能过期），重新解析后重试…", "warn");
     item.stream = null; item.streamAt = 0;
     const ok = await ensureStream(item);
-    if (!ok) { log("重新解析失败：" + (item.errMsg || "未知原因"), "bad"); return; }
+    if (!ok) {
+      log("重新解析失败：" + (item.errMsg || "未知原因"), "bad");
+      dropVideoSource();          // 别让 <video> 顶着坏源，它会在左上角画破图图标
+      return;
+    }
     swapSource(item.stream);      // 和正常换片走同一条路，避免控制条闪出来
     player.play().catch(() => {});
   });
