@@ -304,6 +304,10 @@ https://www.douyin.com/video/7578091056131901007
         <canvas class="ambient" id="ambient" width="64" height="36"></canvas>
         <video id="player" playsinline preload="auto" controls controlsList="nofullscreen"></video>
         <img id="poster" class="poster" alt="">
+        <!-- 图文贴的背景音乐。视频自带音轨，所以只在图文时用；hidden 不能省，
+             否则会在布局里占位（.phone 是 flex 之外的普通块，一个可见的空 <audio>
+             仍会撑出高度）。 -->
+        <audio id="bgm" loop hidden></audio>
         <div class="scrim"></div>
         <div class="caption" id="caption"></div>
       </div>
@@ -318,6 +322,7 @@ https://www.douyin.com/video/7578091056131901007
   const $ = (id) => document.getElementById(id);
   const player = $("player"), phone = $("phone"), placeholder = $("placeholder");
   const poster = $("poster");   // 图文贴用的 <img>（视频时隐藏）
+  const bgm = $("bgm");         // 图文贴的背景音乐（视频时不用）
 
   // ---------------------------------------------------------------- 日志
   const logEl = $("log"), t0 = Date.now();
@@ -429,6 +434,10 @@ https://www.douyin.com/video/7578091056131901007
       item.streamAt = Date.now();
       item.images = r.images || null;      // 图文：多张图（已转成本地中转地址）
       item.imageDuration = r.imageDuration || 3000;
+      item.music = r.music || null;        // 图文：背景音乐（同样走本地中转）
+      item.musicTitle = r.musicTitle || "";
+      item.musicDuration = r.musicDuration || 0;
+      item.musicFrom = r.musicFrom || "";  // "music"=原声直链 / "video-audio"=商业曲兜底
       titleCache[item.id] = {
         ok: true, title: item.title, d: item.duration,
         w: r.width, h: r.height, kind: item.kind,
@@ -502,6 +511,9 @@ https://www.douyin.com/video/7578091056131901007
     updateProgress();
     placeholder.hidden = false;
     phone.hidden = true;
+    stopImages();          // 定时器 / 在途回调一起作废
+    stopPosterMusic();     // 否则清的只是队列，图文音乐还在响
+    poster.removeAttribute("src");
     $("caption").textContent = "";
     $("nowplaying").textContent = "";
   }
@@ -655,17 +667,19 @@ https://www.douyin.com/video/7578091056131901007
     if (item.kind === "images" && item.images && item.images.length) {
       log("图文 #" + (i + 1) + "（" + item.images.length + " 张）→ " +
           (item.title || item.id).slice(0, 34));
+      playPosterMusic(item);
       showImages(item);
       saveQueue();
       prefetch(i, 3);
       return;
     }
 
-    // 从图文切回视频：把 <img> 上那张图丢掉。
+    // 从图文切回视频：把 <img> 上那张图丢掉、把图文音乐停掉。
     // ⚠️ 必须一起清 src —— .poster 平时靠 CSS display:none 藏起来，但
     //    一旦再切回任何图文，.show-image 一加上它立刻可见，那时新图还没下载完，
     //    屏幕上留着的就是上一次那张旧图。
     stopImages();
+    stopPosterMusic();
     poster.removeAttribute("src");
     phone.classList.remove("show-image");
     log("播放 #" + (i + 1) + " → " + (item.title || item.id).slice(0, 40));
@@ -682,6 +696,36 @@ https://www.douyin.com/video/7578091056131901007
 
     saveQueue();
     prefetch(i, 3);
+  }
+
+  // ---------------------------------------------------------------- 图文贴的背景音乐
+  // 图文没有音轨，抖音给的是 `music.play_url`（ies-music/*.mp3，实测不需要 Referer）。
+  // 播放策略：整组图停留期间【循环】放 —— 实测 music.duration 经常只有十几秒，
+  // 比一组图的停留时间短，放一遍的话后半段就安静了。切走时立刻停。
+  // 视频条目不走这里（它自带音轨）。
+  function stopPosterMusic() {
+    if (bgm.paused && !bgm.getAttribute("src")) return;
+    try { bgm.pause(); } catch (e) { /* ignore */ }
+    bgm.removeAttribute("src");   // 连源一起清，别让它继续下载
+    try { bgm.load(); } catch (e) { /* ignore */ }
+  }
+
+  function playPosterMusic(item) {
+    stopPosterMusic();            // 换条目：先把上一条的音乐掐掉
+    if (!item || !item.music) return;
+    if (!$("opt-autoplay").checked) return;   // 和视频一起看「自动播放」开关
+    if (bgm.getAttribute("src") !== item.music) bgm.src = item.music;
+    const p = bgm.play();
+    if (p && typeof p.catch === "function") {
+      // 自动播放被拦（用户手势还没产生）时不用刷屏提示：下一轮操作会再试
+      p.catch(() => {});
+    }
+    if (item.musicTitle) {
+      // 商业曲拿不到 `music.play_url`，服务端退回了作品自带的音频轨（文件大得多），
+      // 日志里标出来，免得以后看到"怎么慢了一拍"又想不起来为什么。
+      log("背景音乐：" + item.musicTitle.slice(0, 30) +
+          (item.musicFrom === "video-audio" ? "（版权曲，取自作品音轨）" : ""));
+    }
   }
 
   // 换源：换 src 会让浏览器停掉旧播放 → 触发 pause → Chrome 在暂停时会弹出控制条，

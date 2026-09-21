@@ -42,8 +42,10 @@ const DETAIL_HEADERS = {
 };
 
 // 只允许中转抖音自己的 CDN，避免这个接口变成开放代理
+// douyinstatic.com 是音频（`ies-music/*.mp3`）的域名 —— 图文贴的背景音乐走它，
+// 漏了这条会被下面 403 挡掉，表现为"图文没声音"。
 const ALLOWED_CDN =
-  /(^|\.)(douyinvod\.com|douyinpic\.com|douyin\.com|byteimg\.com|ibyteimg\.com|zjcdn\.com|snssdk\.com|bytedance\.com)$/i;
+  /(^|\.)(douyinvod\.com|douyinpic\.com|douyinstatic\.com|douyin\.com|byteimg\.com|ibyteimg\.com|zjcdn\.com|snssdk\.com|bytedance\.com)$/i;
 
 const ID_RE = /\d{15,25}/;
 
@@ -54,6 +56,48 @@ function json(res, status, obj) {
     "cache-control": "no-store",
   });
   res.end(body);
+}
+
+/** 从作品数据里取一个"可播的音频地址"，取不到返回 ""。
+ *
+ *  ⚠️ 为什么需要两条路 —— 图文贴用的曲子分两类，接口对它们的待遇完全不同：
+ *
+ *  1. **原声**（`music.title` 形如「@某某创作的原声」）：`music.play_url.url_list[0]`
+ *     给一个 `ies-music/*.mp3`，实测 200 / audio/mpeg / 头部 "ID3"，
+ *     ~200KB，**不需要 Referer、不需要 cookie**。这是最好的源。
+ *
+ *  2. **有版权的商业曲**（如 `music.title` = "Vagrant Poet"）：接口**只返回一个空壳**
+ *     —— `play_url` 对象在，但 `url_list` 是空数组，一个地址都不给（授权限制）。
+ *     只走 `play_url` 的话这类图文全部静音，而图文贴里商业曲占比很高。
+ *
+ *      兜底办法：图文贴响应里那个方形 `video` 字段其实是**纯音频轨**
+ *      （实测前 512KB 里只有 `soun`/`mp4a`，没有 `vide`/`avc1`），
+ *      即「画面定格 + 混好音」的那条流，`play_addr` 照样能播（实测 206 / audio/mp4）。
+ *      代价是整条音轨的文件大得多（实测 8.2MB / 523 秒 vs 234KB / 14 秒）。
+ */
+function audioUrlOf(d) {
+  const m = (d && d.music) || {};
+  const music = (m.play_url && m.play_url.url_list && m.play_url.url_list[0]) || "";
+  if (music) return { url: music, from: "music" };
+
+  // 商业曲：退回作品自带的音频轨
+  const v = (d && d.video) || {};
+  const pick = v.play_addr_h264 || v.play_addr || v.play_addr_265;
+  const fb = (pick && pick.url_list && pick.url_list[0]) || "";
+  return { url: fb, from: "video-audio" };
+}
+
+/** 提取这条作品的背景音乐（返回的对象会展开进 /api/play 的响应里） */
+function musicOf(d) {
+  const { url, from } = audioUrlOf(d);
+  if (!url) return {};
+  const m = (d && d.music) || {};
+  return {
+    music: "/api/stream?u=" + encodeURIComponent(url),
+    musicTitle: m.title || "",                   // 形如「@某某创作的原声」
+    musicDuration: m.duration || 0,              // 秒（`music.duration` 是完整的曲长）
+    musicFrom: from,                             // "music" = 原声直链；"video-audio" = 商业曲兜底
+  };
 }
 
 /** 解析视频直链 + 元信息（时长/封面/尺寸） */
@@ -117,6 +161,7 @@ async function resolvePlay(id) {
         images: imgs.map((x) => "/api/stream?u=" + encodeURIComponent(x.url)),
         // 每张默认停留 3 秒，前端据此自动翻页
         imageDuration: (d.images[0] && d.images[0].duration) || 3000,
+        ...musicOf(d),
       };
     }
   }
