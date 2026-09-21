@@ -185,8 +185,13 @@ node smoke-test.mjs "路径\douyin-likes-xxx.txt"       # 额外校验一份真�
   播放区尺寸可以直接量，不会出现「内容撑高 stage → stage 又决定内容」的循环。
 - **播放区尺寸按朝向分开处理**：横屏让盒子贴合视频比例（同时撑满宽高、不裁切），
   竖屏铺满宽度 + 占满可用高度，两侧留白给模糊背景。
-- **模糊背景**用一张 64×36 的 canvas，在视频第一帧就绪时取色，CSS 放大 + 重模糊。
-  视频流经本地服务同源中转，所以 `drawImage` 不会污染 canvas。
+- **模糊背景**用一张 64×36 的 canvas，CSS 放大 + 重模糊，**视频和图文共用**：
+  视频取第一帧（`loadeddata` 时），图文取**当前正在显示的那张图**（每张显示时重新取样，
+  所以背景跟着当前图的配色走）。取样源不同但都经本地服务同源中转，`drawImage` 不会污染 canvas。
+  - 图文能取到色的前提是 `.poster` 用了 `object-fit:contain`：竖图在横屏 stage 里两侧会留白，
+    那圈留白才透得出 ambient（元素盒子本身是满的，不留白就没地方显示）。
+  - 取样点放在 `poster.decode()` 完成之后（poster 已赋值且已解码，`naturalWidth` 才有值）。
+    实测两条不同颜色的图，canvas 取到的平均色与源图一致（`#e61414` / `#1428e6`）。
 - **方向键必须挂在捕获阶段**：原生 `<video controls>` 在它的 shadow DOM 里自己处理方向键/空格，
   冒泡阶段挂监听器时事件冒上来已经被处理完了。捕获阶段 + `stopPropagation` 才能拦住。
 - **切换视频时不要碰 `controls` 属性**：改 `src` 会触发一次 `pause`，Chrome 一见暂停就显示控制条，
@@ -210,17 +215,29 @@ node smoke-test.mjs "路径\douyin-likes-xxx.txt"       # 额外校验一份真�
   **铁律二：poster 的「可见」也必须门控在解码之后。** 这条不显然 —— 光做铁律一还不够：
   `.show-image` 一加上 poster 就可见，而那时它身上的图可能还没解码完，
   **只要处于「可见但图没准备好」，Chrome 就在元素左上角画破图占位**（那个小图标）。
-  所以 `setPoster()` 开头先 `phone.classList.remove("show-image")`，等 `poster.decode()`
-  完成再加回来；`showImages()` 里【不】加这个类。代价是换图时有几帧黑场（解码很快，基本看不见），
-  换来的是那个占位图标永远不会出现。
+  所以换图的空档要把 poster 藏起来，等 `poster.decode()` 完成再显示。
+  代价是换图时有几帧黑场（解码很快，基本看不见），换来的是那个占位图标永远不会出现。
+
+  ⚠️ **但「藏 poster」必须用一个独立的类（`.poster-wait`），绝不能去摘 `.show-image`。**
+  因为 `.show-image` 是**一个类管两件事**：`.phone.show-image .poster{display:block}` 和
+  `.phone.show-image video{display:none}`。摘掉它，video 那条 `display:none` 也一起失效 ——
+  video 元素里留着的**上一次播放的那一帧**就会在空档里露出来
+  （现象：同一条图文内图片与图片之间闪出之前的视频）。
+  正确做法：`.show-image` 在整条图文期间**始终挂着**（video 全程被压住），
+  poster 的临时隐藏交给 `.phone.show-image.poster-wait .poster{display:none}`。
 
   配套的 **`posterToken`**：`stopImages()` 每调一次就 +1，所有在途回调（翻页定时器 /
   预载 `onload` / `onerror`）回来先对号，对不上直接丢弃。否则用户在图片下载途中切走，
   旧条目的回调会把新条目的画面改掉。
   顺带把图文的停留计时改成「从真正显示出来那一刻起算」，不再是「从发请求起算」。
-- **头图预载**：`prefetch()` 解析完后 3 条元信息后，顺手 `preloadHead()` 把图文条目的第一张
-  下载 + 解码一次（用 `preloadedHeads` 去重，只在成功时记账）。这样点「下一个」时图已在缓存里。
-  只预载头图 —— 组内第 2 张起用户至少要看 3 秒才轮到，那点下载时间无所谓。
+- **头图预载 + 组内预载**：`prefetch()` 解析完后 3 条元信息后，顺手 `preloadHead()` 把图文条目的第一张
+  下载 + 解码一次（`preloadImage()` 用 `preloaded` 集合去重，只在成功时记账）。
+  另外 `showImages()` 每显示一张就 `preloadNextInGroup(item, idx)` 把**后面两张**也预载掉。
+  - 两条都要，因为它们解决的是不同的切换路径：只预载头图的话，**组内**第 2 张起
+    从来没被预载过，翻到它们时要现下（实测几百毫秒，现象就是"图片之间闪一下空白"）。
+  - 实测（假后端故意加 600ms 下载耗时）：补上组内预载后，除冷启动第一张（622ms）之外，
+    每次组内翻页的空档都是 **0~6ms**，跨条目切下一条是 0~1ms。
+  - 为什么预载 2 张而不是更多：每张默认停留 3 秒，足够下完，再多就是白占带宽。
 - **图文背景音乐**用 `<audio id="bgm" loop hidden>`，和 poster 同一个父容器。
   - `hidden` 不能省：`.phone` 里可见的空 `<audio>` 会撑出高度。
   - 播放/停止是 `playPosterMusic()` / `stopPosterMusic()`。**停的时候必须连 `src` 一起
@@ -237,6 +254,31 @@ node smoke-test.mjs "路径\douyin-likes-xxx.txt"       # 额外校验一份真�
 
 ## 更新日志
 
+- **左栏四个开关都会记住了**：连播 / 自动播放 / 播完重洗 / 文案，键名一律
+  `tlk_opt_<名字>`（`continue` / `autoplay` / `loop` / `caption`），存 `"1"`/`"0"`；
+  **没存过（`null`）时保持 HTML 里写死的默认勾选状态**，所以以后改默认值不用动迁移逻辑。
+  读取集中在一个 `restoreOpts()` 里，并且在**启动那一段之前**调用 —— 因为
+  `opt-autoplay` 决定恢复队列后是否自动开播、`opt-continue` 决定 `video.loop`、
+  `opt-caption` 决定文案和遮罩的显隐，晚一步都会「先按默认值闪一下」。
+  `restoreOpts()` 里顺手把副作用落实（`applyContinueOpt()` / `applyCaptionOpt()`），
+  所以原来 `applyContinueOpt()` 在启动时的单独调用已经不需要了。
+- **修「同一条图文内，图片与图片之间会闪出短暂空白」**：空档＝新图的**下载时间**
+  （实测解码只要 8ms，下载要几百毫秒）。根因是只预载了各条图文的**头图**，
+  组内第 2 张起从没预载过。改法：`showImages()` 每显示一张就把后面两张也预载掉
+  （`preloadNextInGroup()`）。实测补上之后，除冷启动第一张外每次组内翻页空档 0~6ms。
+- **`/api/stream` 对图片放行缓存**：抖音图片 CDN 返回 `cache-control: max-age=31536000`
+  （按 URL 不可变），而这里原来一刀切成 `no-store`，等于让浏览器每次换图都重新下载。
+  现在按 content-type 判断：**图片**沿用上游的缓存头（只在成功响应上放行，
+  403/404 绝不缓存），**视频/音频**继续 `no-store`（直链有时效）。
+  注：实测这一条不是空档的主因（预载已经消化了大部分），但方向是对的，能省掉重复请求。
+- **图文的模糊背景**：原来只有视频有那圈模糊底色，图文是纯黑。现在两者共用同一套取色
+  （`drawAmbientFrom()`），图文在**每张图显示出来时**重新取样，所以背景跟着当前这张图的配色走。
+  取样点必须在 `poster.decode()` 之后，否则 `naturalWidth` 还是 0、取不到色。
+- **修「同一条图文内，图片与图片之间会闪出之前的视频」**：这是上一版修破图图标时**引入**的。
+  为了藏掉 poster，我当时摘了 `.show-image`；但那个类同时管着
+  `.phone.show-image video{display:none}`，一摘 video 就露出来了，
+  显示的是它里面留着的上一帧。改法见「铁律二」下面的 ⚠️：
+  新增独立的 `.poster-wait` 只管 poster，`.show-image` 整条图文期间不再摘。
 - **图文贴会放背景音乐了**：图文没有音轨，抖音给的是 `music.play_url`（`ies-music/*.mp3`，
   实测不需要 Referer）。服务端 `musicOf()` 把它转成本地中转地址，前端用 `<audio loop>`
   在整组图停留期间**循环**放（`music.duration` 常常只有十几秒，比一组图的停留时间短），

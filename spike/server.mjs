@@ -493,11 +493,28 @@ const server = http.createServer(async (req, res) => {
         console.log(`[stream] 上游 ${up.status} —— 直链可能已过期或 Referer 被拒`);
       }
 
+      const upType = up.headers.get("content-type") || "";
+      // 视频/音频的直链是有时效的（约 3 小时），而且换源后内容会变 —— 一律不缓存。
+      // 但**图片必须放行缓存**：抖音图片 CDN 返回的是 `max-age=31536000`（按 URL 不可变），
+      // 之前这里一刀切成 no-store，导致浏览器每次换图都重新下载一遍，
+      // 前端那个「头图预载」也就完全白做了（现象：图片与图片之间有一段空白）。
+      // 只在成功响应上放行：403/404 那种错误响应绝不能缓存，否则会一直坏着。
+      const isImage = /^image\//i.test(upType);
+      const cacheable = isImage && up.status < 400;
+
       const outHeaders = {
-        "content-type": up.headers.get("content-type") || "video/mp4",
+        "content-type": upType || "video/mp4",
         "accept-ranges": up.headers.get("accept-ranges") || "bytes",
-        "cache-control": "no-store",
+        "cache-control": cacheable
+          ? (up.headers.get("cache-control") || "public, max-age=86400")
+          : "no-store",
       };
+      if (cacheable) {
+        for (const h of ["etag", "last-modified"]) {
+          const v = up.headers.get(h);
+          if (v) outHeaders[h] = v;
+        }
+      }
       for (const h of ["content-length", "content-range"]) {
         const v = up.headers.get(h);
         if (v) outHeaders[h] = v;

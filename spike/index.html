@@ -119,6 +119,13 @@
           object-fit:contain;background:transparent;display:none}
   .phone.show-image .poster{display:block}
   .phone.show-image video{display:none}
+  /* ⚠️ 「让 poster 暂时不可见」必须是独立的一个类，**不能靠摘掉 .show-image 实现**。
+      因为 .show-image 同时管着上面那条 video{display:none} —— 一摘掉，video 那条也失效，
+      切换图片的空档里就会露出上一次播放的视频画面。
+      所以：.show-image 在整条图文期间始终挂着（video 全程被压住），
+      换图的空档只加 .poster-wait，单独把 poster 藏起来。
+      选择器比 .show-image .poster 长一节，特异性更高，能压住它。 */
+  .phone.show-image.poster-wait .poster{display:none}
 
   /* background 必须是 transparent！
      <video> 用 object-fit:contain 时元素盒子仍是满的，视频内容在里面留黑边，
@@ -128,10 +135,10 @@
                background:transparent;object-fit:contain}
 
   /* 模糊背景（仿抖音全屏两侧那圈颜色）：
-     在每条视频第一帧就绪时取一次色，画到 64×36 的小 canvas 上，
+     视频取「第一条的第一帧」，图文取「当前正在显示的那张图」，画到 64×36 的小 canvas 上，
      再由 CSS 放大 + 重模糊。静态，不跟着画面动。
      不用第二个 <video> 省一份解码；不用封面图是为了省一次网络请求。
-     视频流经本地服务同源中转，所以 drawImage 不会污染 canvas。 */
+     视频/图片都经本地服务同源中转，所以 drawImage 不会污染 canvas。 */
   .ambient{position:absolute;inset:0;width:100%;height:100%;z-index:0;pointer-events:none;
            filter:blur(48px) saturate(1.7) brightness(.72);transform:scale(1.12)}
 
@@ -555,25 +562,39 @@ https://www.douyin.com/video/7578091056131901007
     }
   }
 
-  /** 预载某条图文贴的头图（只下第一张）。
+  /** 预载一张图（下载 + 解码一次，之后赋值给 <img> 就能立刻出画）。
    *
-   *  为什么值得：图片走本地 /api/stream 中转，实测要 700ms 上下才到手，而这期间
-   *  播放区是空的（切条目时 poster 的 src 必须清掉，否则会残留上一条那张图）。
-   *  提前把图下载 + 解码一次，点「下一个」时它在缓存里，赋值即出画。
-   *
-   *  只预载头图：组内第 2 张起，用户至少要看 3 秒才轮到，那点下载时间无所谓。
-   *  另外用 preloadedHeads 去重 —— 预载只该在「还没见过这张图」时发生一次。 */
-  const preloadedHeads = new Set();
+   *  为什么值得：图片走本地 /api/stream 中转，实测下载要几百毫秒，而这期间播放区
+   *  是空的（换图时 poster 必须先藏起来，否则会残留上一张或露出破图占位）。
+   *  用 preloaded 去重 —— 预载只该在「还没见过这张图」时发生一次。 */
+  const preloaded = new Set();
 
-  function preloadHead(item) {
-    if (!item || item.kind !== "images") return;
-    const url = item.images && item.images[0];
-    if (!url || preloadedHeads.has(url)) return;
+  function preloadImage(url) {
+    if (!url || preloaded.has(url)) return;
     const pre = new Image();
     pre.decoding = "async";
     // 只有真下载成功才记账：失败不记，下次还有机会重试
-    pre.onload = () => preloadedHeads.add(url);
+    pre.onload = () => preloaded.add(url);
     pre.src = url;
+  }
+
+  /** 预载这张图之后的两张（组内翻页用）。
+   *
+   *  ⚠️ 这是「同一组图内翻页也有空档」的修法：原来只预载各条图文的头图，
+   *     组内第 2 张起从没被预载过，所以翻到它们时要现下（实测几百毫秒，
+   *     表现就是图与图之间闪一下空白）。
+   *  预载 2 张：每张默认停留 3 秒，足够下完；再多就是白占带宽了。 */
+  function preloadNextInGroup(item, idx) {
+    if (!item || !item.images) return;
+    for (let k = idx + 1; k <= idx + 2 && k < item.images.length; k++) {
+      preloadImage(item.images[k]);
+    }
+  }
+
+  /** 预载某条图文贴的头图（切到下一条时用） */
+  function preloadHead(item) {
+    if (!item || item.kind !== "images") return;
+    preloadImage(item.images && item.images[0]);
   }
 
   /** 后台预取往后几条，让「下一个」点下去就能秒播 */
@@ -676,12 +697,13 @@ https://www.douyin.com/video/7578091056131901007
 
     // 从图文切回视频：把 <img> 上那张图丢掉、把图文音乐停掉。
     // ⚠️ 必须一起清 src —— .poster 平时靠 CSS display:none 藏起来，但
-    //    一旦再切回任何图文，.show-image 一加上它立刻可见，那时新图还没下载完，
-    //    屏幕上留着的就是上一次那张旧图。
+    //    再切回任何图文时 .show-image 一加上它立刻可见。所以离开图文时必须
+    //    把图和「等待中」的标记一起清掉，别把状态带到下一条。
     stopImages();
     stopPosterMusic();
     poster.removeAttribute("src");
     phone.classList.remove("show-image");
+    phone.classList.remove("poster-wait");
     log("播放 #" + (i + 1) + " → " + (item.title || item.id).slice(0, 40));
 
     // 换片：直接换 src 并尝试自动播放。
@@ -794,22 +816,21 @@ https://www.douyin.com/video/7578091056131901007
    *
    *  ok 才是「真的画出来了」，只有它才允许安排下一次翻页。 */
   function setPoster(url, token, ok, fail) {
-    // ⚠️ 关键：新图没准备好之前，poster 必须处于「隐藏」状态。
-    //    .phone.show-image 一加上，poster 立刻可见；这时它身上要么是上一张
-    //    旧图、要么是个还没画出来的 src —— Chrome 在「有 src 但还没有可用
-    //    图像」的那段时间会在元素左上角画破图占位，就是这个图标。
-    //    先摘掉类把画面让出来（黑场），等图片真解码完再显示，占位就没机会出现。
-    phone.classList.remove("show-image");
+    // 新图没准备好之前，把 poster 藏掉（由 .poster-wait 单独控制）。
+    // ⚠️ 注意这里【不能】去摘 .show-image —— 那个类还管着 video{display:none}，
+    //    一摘就会在空档里露出上一次播放的视频画面。见上面 CSS 里那条注释。
+    phone.classList.add("poster-wait");
     const pre = new Image();
     pre.decoding = "async";
     pre.onload = () => {
       if (token !== posterToken) return;      // 期间切走了，这张图作废
       poster.src = url;
       // 等「这一张」解码完才允许显示。decode() 在图片已可用时很快返回，
-      // 所以这个黑场只有几帧；而它换来的是「绝不出现破图占位」。
+      // 所以这个空档只有几帧；而它换来的是「绝不出现破图占位」。
       const show = () => {
         if (token !== posterToken) return;
-        phone.classList.add("show-image");
+        phone.classList.remove("poster-wait");
+        drawPosterAmbient();      // 模糊背景跟着这张图重新取色
         ok();
       };
       if (poster.decode) poster.decode().then(show, show);
@@ -826,8 +847,9 @@ https://www.douyin.com/video/7578091056131901007
     stopImages();
     const token = posterToken;
     player.pause();
-    // 这里【不】加 show-image —— 由 setPoster 在第一张解码完成后才加，
-    // 否则会出现「类已加上、图还没到」的空档（见 setPoster 里的说明）。
+    // 整条图文期间 .show-image 一直挂着：它同时负责「显示 poster」和「压住 video」，
+    // poster 自己的临时隐藏交给 .poster-wait（见 setPoster）。
+    phone.classList.add("show-image");
     applyStageSize(item);        // 按第一张图的宽高比定播放区形状
 
     const total = item.images.length;
@@ -838,6 +860,7 @@ https://www.douyin.com/video/7578091056131901007
     const step = () => {
       cur = item.images[idx];
       const no = idx + 1;
+      preloadNextInGroup(item, idx);   // 先把后面两张备好，翻过去时才不用现下
       // 组内翻页：等新图解码完再换，中间不会闪一下空白
       setPoster(cur, token, () => {
         if (token !== posterToken) return;
@@ -1084,29 +1107,43 @@ https://www.douyin.com/video/7578091056131901007
   // 窗口变化会自动跟着变，不需要 JS 重算。
 
   // ------------------------------------------------ 模糊背景（仿抖音全屏两侧）
-  // 把当前视频帧画进一张 64×36 的小 canvas，再交给 CSS 放大 + 重模糊。
+  // 把当前画面画进一张 64×36 的小 canvas，再交给 CSS 放大 + 重模糊。
+  // 视频和图文共用这套：视频取第一帧，图文取当前这张图。
   // 为什么不用第二个 <video>：省一份解码。为什么不用封面图：颜色会跟着画面动。
   // 限流到 ~8fps —— 这是背景装饰，不需要跟着视频满帧。
   const ambient = $("ambient");
   const ambientCtx = ambient.getContext("2d");
   let ambientLogged = 0;   // 0=未记录 1=已成功记录 2=已失败记录
 
-  // 只在「这一条视频的第一帧就绪」时画一次，之后完全不动。
-  // 不做实时更新 —— 背景只是配色，跟着画面动没有意义，还白费 CPU。
-  function drawAmbientOnce() {
-    if (!player.videoWidth) return;
-    const vw = player.videoWidth, vh = player.videoHeight;
+  /** 把一个「有画面的源」（<video> 或 <img>）取样到模糊背景上。
+   *  srcW/srcH 是它的原始尺寸；两个值必须传对，否则铺不满或者比例错。 */
+  function drawAmbientFrom(src, srcW, srcH) {
+    if (!srcW || !srcH) return;
     const cw = ambient.width, ch = ambient.height;
     // 按 cover 铺满 canvas 并居中，多余部分裁掉（画到 canvas 外的会被自动裁）
-    const s = Math.max(cw / vw, ch / vh);
-    const dw = vw * s, dh = vh * s;
+    const s = Math.max(cw / srcW, ch / srcH);
+    const dw = srcW * s, dh = srcH * s;
     try {
-      // 视频流经本地服务同源中转，所以这里不会污染 canvas
-      ambientCtx.drawImage(player, (cw - dw) / 2, (ch - dh) / 2, dw, dh);
-      if (ambientLogged !== 1) { ambientLogged = 1; log("模糊背景已取样（" + vw + "×" + vh + "）", "ok"); }
+      // 视频/图片都经本地服务同源中转，所以这里不会污染 canvas
+      ambientCtx.drawImage(src, (cw - dw) / 2, (ch - dh) / 2, dw, dh);
+      if (ambientLogged !== 1) { ambientLogged = 1; log("模糊背景已取样（" + srcW + "×" + srcH + "）", "ok"); }
     } catch (e) {
       if (ambientLogged !== 2) { ambientLogged = 2; log("模糊背景绘制失败：" + e.message, "bad"); }
     }
+  }
+
+  /** 视频：只在「这一条的第一帧就绪」时画一次，之后完全不动。
+   *  不做实时更新 —— 背景只是配色，跟着画面动没有意义，还白费 CPU。 */
+  function drawAmbientOnce() {
+    if (!player.videoWidth) return;
+    drawAmbientFrom(player, player.videoWidth, player.videoHeight);
+  }
+
+  /** 图文：每显示一张图就重新取样一次。
+   *  这样背景跟着当前这张图的配色走，和视频里"每条换一次底色"的观感一致。
+   *  取样源用 poster 自己（它此刻必然是已解码、正在显示的那张）。 */
+  function drawPosterAmbient() {
+    drawAmbientFrom(poster, poster.naturalWidth, poster.naturalHeight);
   }
 
   // loadeddata = 第一帧已可用；换视频会重新触发，所以每条都会重新取色
@@ -1122,6 +1159,42 @@ https://www.douyin.com/video/7578091056131901007
     else log("已经是最后一个了", "warn");
   });
 
+  // ---------------------------------------------------------------- 播放选项的记忆
+  // 左栏那四个勾选框都记在 localStorage 里，下次打开保持原样。
+  // 约定：开了存 "1"，关了存 "0"；没存过（null）时保持 HTML 里的默认勾选状态。
+  const OPT_KEY = {
+    continue: "tlk_opt_continue",     // 连播
+    autoplay: "tlk_opt_autoplay",     // 自动播放
+    loop:     "tlk_opt_loop",         // 播完重洗
+    caption:  "tlk_opt_caption",      // 文案
+  };
+  const OPT_EL = {
+    continue: "opt-continue", autoplay: "opt-autoplay",
+    loop: "opt-loop", caption: "opt-caption",
+  };
+
+  function saveOpt(name, on) {
+    try { localStorage.setItem(OPT_KEY[name], on ? "1" : "0"); }
+    catch (e) { /* 配额满就算了，不影响播放 */ }
+  }
+
+  /** 把存下来的四个开关读回来，并立刻落实它们各自的作用。
+   *  ⚠️ 必须在「启动」那一段之前跑完：`opt-autoplay` 影响恢复队列后是否自动开播，
+   *     `opt-continue` 决定 video.loop，`opt-caption` 决定文案和遮罩的显隐 ——
+   *     晚一步都会出现「先按默认值闪一下」的观感。 */
+  function restoreOpts() {
+    for (const name of Object.keys(OPT_KEY)) {
+      const el = $(OPT_EL[name]);
+      try {
+        const v = localStorage.getItem(OPT_KEY[name]);
+        if (v === "1") el.checked = true;
+        else if (v === "0") el.checked = false;
+      } catch (e) { /* ignore：读不到就用 HTML 里的默认值 */ }
+    }
+    applyContinueOpt();   // 顺带把 video.loop 对上
+    applyCaptionOpt();    // 顺带把 no-caption 落在 DOM 上
+  }
+
   // 「连播」开关：不勾就把 <video> 自己的 loop 打开。
   // 用原生 loop 而不是在 ended 里 currentTime=0 + play()：
   //   原生循环是无缝的，自己重播会闪一下黑（视频要重新定位到 0）。
@@ -1130,9 +1203,22 @@ https://www.douyin.com/video/7578091056131901007
   }
   $("opt-continue").addEventListener("change", () => {
     applyContinueOpt();
+    saveOpt("continue", $("opt-continue").checked);
     log(player.loop ? "关闭连播，将循环播放当前视频" : "开启连播，播完切下一个", "ok");
   });
-  applyContinueOpt();
+
+  // 「播完重洗」：连播走完一轮后是否重新洗牌。这里没有副作用要立刻落实，
+  // 所以只挂「变了就存」。
+  $("opt-loop").addEventListener("change", () => {
+    saveOpt("loop", $("opt-loop").checked);
+    log($("opt-loop").checked ? "一轮播完会重新洗牌" : "一轮播完就停下", "ok");
+  });
+
+  // 「自动播放」同理：它只在切条目那一刻被读，不需要启动时落实。
+  $("opt-autoplay").addEventListener("change", () => {
+    saveOpt("autoplay", $("opt-autoplay").checked);
+    log($("opt-autoplay").checked ? "切换后自动开播" : "切换后停住等手势", "ok");
+  });
 
   // 「文案」开关：关掉时给 .phone 加 no-caption，由 CSS 同时隐藏文案和遮罩
   function applyCaptionOpt() {
@@ -1140,9 +1226,10 @@ https://www.douyin.com/video/7578091056131901007
   }
   $("opt-caption").addEventListener("change", () => {
     applyCaptionOpt();
+    saveOpt("caption", $("opt-caption").checked);
     log($("opt-caption").checked ? "显示文案" : "隐藏文案", "ok");
   });
-  applyCaptionOpt();
+  applyCaptionOpt();   // 尽早落到 DOM：不能等第一条已经开始播才隐藏，否则会闪一下文案
 
   // 直链有有效期（约 3 小时）。出错时重新解析一次再试，避免"看着看着就播不动"
   let lastErrRetry = 0;
@@ -1330,6 +1417,10 @@ https://www.douyin.com/video/7578091056131901007
   });
 
   // ---------------------------------------------------------------- 启动
+  // 先把左栏四个开关的记忆恢复出来并落实 —— 必须在下面 play() 之前，
+  // 否则「自动播放 / 连播 / 文案」会先按默认值闪一下再纠正。
+  restoreOpts();
+
   const restored = restoreQueue();
   if (restored) {
     renderQueue();
